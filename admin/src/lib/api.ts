@@ -19,6 +19,25 @@ export function getAuthToken(): string | null {
   return inMemoryToken;
 }
 
+export class ApiError extends Error {
+  status: number;
+  fieldErrors?: Record<string, string>;
+
+  constructor(message: string, status: number, fieldErrors?: Record<string, string>) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+    this.fieldErrors = fieldErrors;
+  }
+}
+
+export function extractFieldErrors(err: unknown): Record<string, string> {
+  if (err instanceof ApiError && err.fieldErrors) {
+    return err.fieldErrors;
+  }
+  return {};
+}
+
 export async function apiRequest<T>(path: string, options: RequestInit = {}): Promise<T> {
   const headers = new Headers(options.headers || {});
   if (!headers.has('Content-Type') && options.body && typeof options.body === 'string') {
@@ -48,11 +67,19 @@ export async function apiRequest<T>(path: string, options: RequestInit = {}): Pr
 
   if (!response.ok) {
     let errorMessage = `Request failed (${response.status})`;
+    let fieldErrors: Record<string, string> | undefined;
     const errData = tryParseJson();
     if (errData && typeof errData.error === 'string') {
       errorMessage = errData.error;
     }
-    throw new Error(errorMessage);
+    if (errData && typeof errData.fieldErrors === 'object' && errData.fieldErrors !== null && !Array.isArray(errData.fieldErrors)) {
+      const cleaned: Record<string, string> = {};
+      for (const [k, v] of Object.entries(errData.fieldErrors as Record<string, unknown>)) {
+        if (typeof v === 'string') cleaned[k] = v;
+      }
+      if (Object.keys(cleaned).length > 0) fieldErrors = cleaned;
+    }
+    throw new ApiError(errorMessage, response.status, fieldErrors);
   }
 
   if (contentType.includes('text/csv')) {

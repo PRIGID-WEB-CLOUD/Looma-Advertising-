@@ -1,5 +1,12 @@
 import React, { useEffect, useState } from 'react';
-import { apiRequest, formatMicros, formatNumber } from '../lib/api';
+import { X } from 'lucide-react';
+import { apiRequest, extractFieldErrors, formatMicros, formatNumber } from '../lib/api';
+import { FieldError, fieldBorderClass } from './FieldError';
+import {
+  type FieldErrors,
+  validatePlatformSettingsInput,
+  validateProhibitedCategoryInput,
+} from '../lib/validation';
 
 export type AdminTab = 'overview' | 'moderation' | 'advertisers' | 'publishers' | 'fraud' | 'finance' | 'settings';
 
@@ -63,6 +70,23 @@ export const AdminWorkspace: React.FC<AdminWorkspaceProps> = ({ activeTab }) => 
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [actionMsg, setActionMsg] = useState<string | null>(null);
+  const [policyErrors, setPolicyErrors] = useState<FieldErrors>({});
+  const [settingsErrors, setSettingsErrors] = useState<FieldErrors>({});
+
+  const clearPolicyError = (key: string) =>
+    setPolicyErrors((prev) => {
+      if (!prev[key]) return prev;
+      const next = { ...prev };
+      delete next[key];
+      return next;
+    });
+  const clearSettingsError = (key: string) =>
+    setSettingsErrors((prev) => {
+      if (!prev[key]) return prev;
+      const next = { ...prev };
+      delete next[key];
+      return next;
+    });
 
   async function loadAll() {
     setLoading(true);
@@ -99,6 +123,19 @@ export const AdminWorkspace: React.FC<AdminWorkspaceProps> = ({ activeTab }) => 
   useEffect(() => {
     loadAll();
   }, []);
+
+  useEffect(() => {
+    setActionMsg(null);
+    setError(null);
+    setPolicyErrors({});
+    setSettingsErrors({});
+  }, [tab]);
+
+  useEffect(() => {
+    if (!actionMsg) return;
+    const timer = window.setTimeout(() => setActionMsg(null), 5000);
+    return () => window.clearTimeout(timer);
+  }, [actionMsg]);
 
   async function handleModerationDecision(campaignId: string, decision: 'approved' | 'rejected' | 'suspended') {
     setError(null);
@@ -167,12 +204,26 @@ export const AdminWorkspace: React.FC<AdminWorkspaceProps> = ({ activeTab }) => 
   async function handleSaveSettings(e: React.FormEvent) {
     e.preventDefault();
     if (!settings) return;
-    await apiRequest('/api/admin/settings', {
-      method: 'PUT',
-      body: JSON.stringify({ settings }),
-    });
-    setActionMsg('Platform configuration saved.');
-    await loadAll();
+    setError(null);
+    setActionMsg(null);
+    setSettingsErrors({});
+    const check = validatePlatformSettingsInput(settings);
+    if (!check.valid) {
+      setSettingsErrors(check.errors);
+      return;
+    }
+    try {
+      await apiRequest('/api/admin/settings', {
+        method: 'PUT',
+        body: JSON.stringify({ settings: check.value }),
+      });
+      setActionMsg('Platform configuration saved.');
+      await loadAll();
+    } catch (err) {
+      const fe = extractFieldErrors(err);
+      if (Object.keys(fe).length > 0) setSettingsErrors(fe);
+      setError(err instanceof Error ? err.message : 'Unable to save platform settings');
+    }
   }
 
   async function handleAppealDecision(id: string, decision: 'approved' | 'rejected') {
@@ -200,15 +251,27 @@ export const AdminWorkspace: React.FC<AdminWorkspaceProps> = ({ activeTab }) => 
     e.preventDefault();
     setError(null);
     setActionMsg(null);
+    setPolicyErrors({});
+    const check = validateProhibitedCategoryInput(newPolicy);
+    if (!check.valid) {
+      setPolicyErrors(check.errors);
+      return;
+    }
     try {
       await apiRequest('/api/admin/prohibited-categories', {
         method: 'POST',
-        body: JSON.stringify(newPolicy),
+        body: JSON.stringify({
+          name: check.value!.name,
+          keywords: check.value!.keywords,
+          severity: check.value!.severity,
+        }),
       });
       setNewPolicy({ name: '', keywords: '', severity: 'block' });
       setActionMsg('Added prohibited category policy rule.');
       await loadAll();
     } catch (err) {
+      const fe = extractFieldErrors(err);
+      if (Object.keys(fe).length > 0) setPolicyErrors(fe);
       setError(err instanceof Error ? err.message : 'Unable to add policy rule');
     }
   }
@@ -274,13 +337,29 @@ export const AdminWorkspace: React.FC<AdminWorkspaceProps> = ({ activeTab }) => 
       </div>
 
       {error && (
-        <div className="p-3.5 rounded-lg border border-red-200 dark:border-red-900 bg-red-50 dark:bg-red-950/40 text-sm text-red-700 dark:text-red-300">
-          {error}
+        <div className="p-3.5 rounded-lg border border-red-200 dark:border-red-900 bg-red-50 dark:bg-red-950/40 text-sm text-red-700 dark:text-red-300 flex items-start justify-between gap-3">
+          <span>{error}</span>
+          <button
+            type="button"
+            onClick={() => setError(null)}
+            aria-label="Dismiss error"
+            className="p-0.5 rounded hover:bg-red-100 dark:hover:bg-red-900/40 shrink-0"
+          >
+            <X className="w-4 h-4" />
+          </button>
         </div>
       )}
       {actionMsg && (
-        <div className="p-3.5 rounded-lg border border-emerald-200 dark:border-emerald-900 bg-emerald-50 dark:bg-emerald-950/40 text-sm text-emerald-800 dark:text-emerald-200">
-          {actionMsg}
+        <div className="p-3.5 rounded-lg border border-emerald-200 dark:border-emerald-900 bg-emerald-50 dark:bg-emerald-950/40 text-sm text-emerald-800 dark:text-emerald-200 flex items-start justify-between gap-3">
+          <span>{actionMsg}</span>
+          <button
+            type="button"
+            onClick={() => setActionMsg(null)}
+            aria-label="Dismiss notification"
+            className="p-0.5 rounded hover:bg-emerald-100 dark:hover:bg-emerald-900/40 shrink-0"
+          >
+            <X className="w-4 h-4" />
+          </button>
         </div>
       )}
 
@@ -462,41 +541,60 @@ export const AdminWorkspace: React.FC<AdminWorkspaceProps> = ({ activeTab }) => 
             <div className="px-4 sm:px-5 py-3.5 border-b border-slate-200 dark:border-slate-800 text-sm font-semibold">
               Prohibited Categories & Automated Policy Rules
             </div>
-            <form onSubmit={handleAddPolicyRule} className="p-4 sm:p-5 border-b border-slate-200 dark:border-slate-800 grid grid-cols-1 md:grid-cols-12 gap-3 items-end">
+            <form onSubmit={handleAddPolicyRule} noValidate className="p-4 sm:p-5 border-b border-slate-200 dark:border-slate-800 grid grid-cols-1 md:grid-cols-12 gap-3 items-start">
               <div className="md:col-span-4">
-                <label className="block text-xs font-medium mb-1">Category Name</label>
+                <label htmlFor="admin-pol-name" className="block text-xs font-medium mb-1">Category Name</label>
                 <input
+                  id="admin-pol-name"
                   type="text"
                   required
                   value={newPolicy.name}
-                  onChange={(e) => setNewPolicy({ ...newPolicy, name: e.target.value })}
+                  onChange={(e) => {
+                    setNewPolicy({ ...newPolicy, name: e.target.value });
+                    clearPolicyError('name');
+                  }}
+                  aria-invalid={Boolean(policyErrors.name)}
+                  aria-describedby={policyErrors.name ? 'admin-pol-name-err' : undefined}
                   placeholder="Unverified Crypto Schemes"
-                  className="w-full px-3 py-2 text-xs rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
+                  className={`w-full px-3 py-2 text-xs rounded-lg border ${fieldBorderClass(Boolean(policyErrors.name))} bg-white dark:bg-slate-950`}
                 />
+                <FieldError id="admin-pol-name-err" message={policyErrors.name} />
               </div>
               <div className="md:col-span-5">
-                <label className="block text-xs font-medium mb-1">Trigger Keywords (comma-separated)</label>
+                <label htmlFor="admin-pol-kw" className="block text-xs font-medium mb-1">Trigger Keywords (comma-separated)</label>
                 <input
+                  id="admin-pol-kw"
                   type="text"
                   required
                   value={newPolicy.keywords}
-                  onChange={(e) => setNewPolicy({ ...newPolicy, keywords: e.target.value })}
+                  onChange={(e) => {
+                    setNewPolicy({ ...newPolicy, keywords: e.target.value });
+                    clearPolicyError('keywords');
+                  }}
+                  aria-invalid={Boolean(policyErrors.keywords)}
+                  aria-describedby={policyErrors.keywords ? 'admin-pol-kw-err' : undefined}
                   placeholder="guaranteed yield, instant 10x token"
-                  className="w-full px-3 py-2 text-xs rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
+                  className={`w-full px-3 py-2 text-xs rounded-lg border ${fieldBorderClass(Boolean(policyErrors.keywords))} bg-white dark:bg-slate-950`}
                 />
+                <FieldError id="admin-pol-kw-err" message={policyErrors.keywords} />
               </div>
               <div className="md:col-span-2">
-                <label className="block text-xs font-medium mb-1">Action</label>
+                <label htmlFor="admin-pol-sev" className="block text-xs font-medium mb-1">Action</label>
                 <select
+                  id="admin-pol-sev"
                   value={newPolicy.severity}
-                  onChange={(e) => setNewPolicy({ ...newPolicy, severity: e.target.value as 'block' | 'review' })}
-                  className="w-full px-3 py-2 text-xs rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
+                  onChange={(e) => {
+                    setNewPolicy({ ...newPolicy, severity: e.target.value as 'block' | 'review' });
+                    clearPolicyError('severity');
+                  }}
+                  className={`w-full px-3 py-2 text-xs rounded-lg border ${fieldBorderClass(Boolean(policyErrors.severity))} bg-white dark:bg-slate-950`}
                 >
                   <option value="block">Auto-Block</option>
                   <option value="review">Flag for Review</option>
                 </select>
+                <FieldError id="admin-pol-sev-err" message={policyErrors.severity} />
               </div>
-              <div className="md:col-span-1">
+              <div className="md:col-span-1 md:pt-5">
                 <button
                   type="submit"
                   className="w-full py-2 text-xs font-medium text-white bg-blue-700 hover:bg-blue-800 rounded-lg"
@@ -879,41 +977,63 @@ export const AdminWorkspace: React.FC<AdminWorkspaceProps> = ({ activeTab }) => 
         <div className="space-y-6">
           <form
             onSubmit={handleSaveSettings}
+            noValidate
             className="w-full border border-slate-200 dark:border-slate-800 rounded-xl p-4 sm:p-6 bg-white dark:bg-slate-900 space-y-4"
           >
             <h2 className="text-base font-semibold">Global Platform Configuration</h2>
             <div>
-              <label className="block text-xs font-medium mb-1">Default Publisher Revenue Share (Basis Points, e.g. 7000 = 70%)</label>
+              <label htmlFor="admin-set-bps" className="block text-xs font-medium mb-1">Default Publisher Revenue Share (Basis Points, e.g. 7000 = 70%)</label>
               <input
+                id="admin-set-bps"
                 type="number"
                 min="1000"
                 max="9500"
                 value={settings.default_publisher_share_bps ?? 7000}
-                onChange={(e) => setSettings({ ...settings, default_publisher_share_bps: Number(e.target.value) })}
-                className="w-full px-3 py-2 text-sm font-mono rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
+                onChange={(e) => {
+                  setSettings({ ...settings, default_publisher_share_bps: Number(e.target.value) });
+                  clearSettingsError('default_publisher_share_bps');
+                }}
+                aria-invalid={Boolean(settingsErrors.default_publisher_share_bps)}
+                aria-describedby={settingsErrors.default_publisher_share_bps ? 'admin-set-bps-err' : undefined}
+                className={`w-full px-3 py-2 text-sm font-mono rounded-lg border ${fieldBorderClass(Boolean(settingsErrors.default_publisher_share_bps))} bg-white dark:bg-slate-950`}
               />
+              <FieldError id="admin-set-bps-err" message={settingsErrors.default_publisher_share_bps} />
             </div>
             <div>
-              <label className="block text-xs font-medium mb-1">Minimum Publisher Payout (USD Micros, 50000000 = $50)</label>
+              <label htmlFor="admin-set-payout" className="block text-xs font-medium mb-1">Minimum Publisher Payout (USD Micros, 50000000 = $50)</label>
               <input
+                id="admin-set-payout"
                 type="number"
                 min="1000000"
                 step="1000000"
                 value={settings.minimum_publisher_payout_micros ?? 50000000}
-                onChange={(e) => setSettings({ ...settings, minimum_publisher_payout_micros: Number(e.target.value) })}
-                className="w-full px-3 py-2 text-sm font-mono rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
+                onChange={(e) => {
+                  setSettings({ ...settings, minimum_publisher_payout_micros: Number(e.target.value) });
+                  clearSettingsError('minimum_publisher_payout_micros');
+                }}
+                aria-invalid={Boolean(settingsErrors.minimum_publisher_payout_micros)}
+                aria-describedby={settingsErrors.minimum_publisher_payout_micros ? 'admin-set-payout-err' : undefined}
+                className={`w-full px-3 py-2 text-sm font-mono rounded-lg border ${fieldBorderClass(Boolean(settingsErrors.minimum_publisher_payout_micros))} bg-white dark:bg-slate-950`}
               />
+              <FieldError id="admin-set-payout-err" message={settingsErrors.minimum_publisher_payout_micros} />
             </div>
             <div>
-              <label className="block text-xs font-medium mb-1">Minimum Campaign Budget (USD Micros)</label>
+              <label htmlFor="admin-set-budget" className="block text-xs font-medium mb-1">Minimum Campaign Budget (USD Micros)</label>
               <input
+                id="admin-set-budget"
                 type="number"
                 min="1000000"
                 step="1000000"
                 value={settings.minimum_campaign_budget_micros ?? 25000000}
-                onChange={(e) => setSettings({ ...settings, minimum_campaign_budget_micros: Number(e.target.value) })}
-                className="w-full px-3 py-2 text-sm font-mono rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
+                onChange={(e) => {
+                  setSettings({ ...settings, minimum_campaign_budget_micros: Number(e.target.value) });
+                  clearSettingsError('minimum_campaign_budget_micros');
+                }}
+                aria-invalid={Boolean(settingsErrors.minimum_campaign_budget_micros)}
+                aria-describedby={settingsErrors.minimum_campaign_budget_micros ? 'admin-set-budget-err' : undefined}
+                className={`w-full px-3 py-2 text-sm font-mono rounded-lg border ${fieldBorderClass(Boolean(settingsErrors.minimum_campaign_budget_micros))} bg-white dark:bg-slate-950`}
               />
+              <FieldError id="admin-set-budget-err" message={settingsErrors.minimum_campaign_budget_micros} />
             </div>
             <label className="flex items-center gap-2 text-xs">
               <input

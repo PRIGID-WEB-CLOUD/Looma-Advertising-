@@ -13,6 +13,25 @@ import {
   validateMediaMagicBytes,
 } from '../security';
 import { releaseReservationInTx } from '../modules/budgetReservations';
+import {
+  ALLOWED_AD_FORMATS,
+  ALLOWED_BIDDING_STRATEGIES,
+  ALLOWED_OBJECTIVES,
+  ALLOWED_PACING_MODES,
+  ALLOWED_PRICING_MODELS,
+  asTrimmedString,
+  validateAppealInput,
+  validateCampaignCreateInput,
+  validateDepositInput,
+  validateDimensions,
+  validateHttpUrl,
+  validateIsoDate,
+  validateMediaUrl,
+  validateNumberRange,
+  validateRefundInput,
+  validateTargetingFields,
+  validateTextLength,
+} from '../../src/lib/validation';
 
 const MAX_UPLOAD_BYTES = 10 * 1024 * 1024; // 10 MB
 
@@ -186,7 +205,7 @@ export function createAdvertiserRouter(db: DatabaseSync): Router {
                 t.browsers_json, t.interest_categories_json, t.contextual_categories_json, t.retargeting_enabled, t.consent_required,
                 adv.id AS advertisement_id, adv.format AS ad_format,
                 crt.id AS creative_id, crt.title AS creative_title, crt.description AS creative_description,
-                crt.media_url, crt.destination_url, crt.cta_text, crt.tracking_params, crt.approval_status AS creative_approval_status,
+                crt.media_url, crt.destination_url, crt.cta_text, crt.tracking_params, crt.dimensions, crt.approval_status AS creative_approval_status,
                 (SELECT COUNT(*) FROM impressions i WHERE i.campaign_id = c.id AND i.is_valid = 1) AS impressions,
                 (SELECT COUNT(*) FROM clicks k WHERE k.campaign_id = c.id AND k.is_valid = 1) AS clicks,
                 (SELECT COUNT(*) FROM conversions v WHERE v.campaign_id = c.id AND v.is_valid = 1) AS conversions
@@ -212,50 +231,44 @@ export function createAdvertiserRouter(db: DatabaseSync): Router {
     }
 
     const body = req.body ?? {};
+    const validation = validateCampaignCreateInput(body);
+    if (!validation.valid || !validation.value) {
+      res.status(400).json({ error: validation.firstError, fieldErrors: validation.errors });
+      return;
+    }
+
     const {
       name,
-      objective = 'website_traffic',
-      pricingModel = 'CPC',
-      biddingStrategy = 'manual',
-      startDate = '2026-01-01',
-      endDate = '2027-12-31',
-      dailyBudgetUsd = 50,
-      totalBudgetUsd = 500,
-      maxBidUsd = 1.25,
-      pacingMode = 'standard',
-      format = 'native',
+      objective,
+      pricingModel,
+      biddingStrategy,
+      startDate,
+      endDate,
+      dailyBudgetUsd,
+      totalBudgetUsd,
+      maxBidUsd,
+      pacingMode,
+      format,
+      dimensions: resolvedDimensions,
       title,
       description,
-      mediaUrl = '',
+      mediaUrl: resolvedMediaUrl,
       destinationUrl,
-      ctaText = 'Learn More',
-      trackingParams = '',
-      countries = ['ALL'],
-      languages = ['en'],
-      deviceCategories = ['desktop', 'mobile'],
-      operatingSystems = ['ALL'],
-      browsers = ['ALL'],
-      contextualCategories = ['ALL'],
-      interestCategories = [],
-      retargetingEnabled = false,
-      consentRequired = true,
-    } = body;
-
-    if (!name || !title || !description || !destinationUrl) {
-      res.status(400).json({ error: 'Campaign name, ad title, description, and destination URL are required' });
-      return;
-    }
-
-    let parsedUrl: URL;
-    try {
-      parsedUrl = new URL(destinationUrl);
-      if (parsedUrl.protocol !== 'https:' && parsedUrl.protocol !== 'http:') {
-        throw new Error('Invalid protocol');
-      }
-    } catch {
-      res.status(400).json({ error: 'Destination URL must be a valid http(s) URL' });
-      return;
-    }
+      ctaText,
+      trackingParams,
+      targeting,
+    } = validation.value;
+    const {
+      countries,
+      languages,
+      deviceCategories,
+      operatingSystems,
+      browsers,
+      contextualCategories,
+      interestCategories,
+    } = targeting;
+    const retargetingEnabled = Boolean(body.retargetingEnabled);
+    const consentRequired = body.consentRequired === false ? false : true;
 
     // Automated prohibited category & policy compliance scan
     const policyRows = db
@@ -289,33 +302,9 @@ export function createAdvertiserRouter(db: DatabaseSync): Router {
       return;
     }
 
-    if (!['CPM', 'CPC', 'CPA', 'CPI', 'CPV', 'FIXED'].includes(String(pricingModel))) {
-      res.status(400).json({ error: 'Invalid pricing model' });
-      return;
-    }
-    if (!['manual', 'auto_cpc', 'target_cpa'].includes(String(biddingStrategy))) {
-      res.status(400).json({ error: 'Invalid bidding strategy' });
-      return;
-    }
-    if (!['standard', 'accelerated'].includes(String(pacingMode))) {
-      res.status(400).json({ error: 'Invalid pacing mode' });
-      return;
-    }
-    if (!['image', 'banner', 'native', 'text', 'video', 'responsive', 'sponsored'].includes(String(format))) {
-      res.status(400).json({ error: 'Invalid ad format' });
-      return;
-    }
-    const parsedDaily = Number(dailyBudgetUsd);
-    const parsedTotal = Number(totalBudgetUsd);
-    const parsedBid = Number(maxBidUsd);
-    if (!Number.isFinite(parsedDaily) || !Number.isFinite(parsedTotal) || !Number.isFinite(parsedBid) || parsedDaily <= 0 || parsedTotal <= 0 || parsedBid <= 0) {
-      res.status(400).json({ error: 'Daily budget, total budget, and max bid must be positive numbers' });
-      return;
-    }
-
-    const dailyMicros = Math.max(5_000_000, Math.round(parsedDaily * 1_000_000));
-    const totalMicros = Math.max(dailyMicros, Math.round(parsedTotal * 1_000_000));
-    const bidMicros = Math.max(100_000, Math.round(parsedBid * 1_000_000));
+    const dailyMicros = Math.round(dailyBudgetUsd * 1_000_000);
+    const totalMicros = Math.round(totalBudgetUsd * 1_000_000);
+    const bidMicros = Math.round(maxBidUsd * 1_000_000);
 
     const campaignId = `cmp_${crypto.randomUUID().slice(0, 10)}`;
 
@@ -353,18 +342,20 @@ export function createAdvertiserRouter(db: DatabaseSync): Router {
          VALUES (?, ?, ?, ?, ?, 'active')`
       ).run(adId, campaignId, advertiserId, String(title).trim(), String(format));
 
+      const creativeId = `crt_${crypto.randomUUID().slice(0, 10)}`;
       db.prepare(
         `INSERT INTO ad_creatives (id, advertisement_id, title, description, media_url, destination_url, cta_text, tracking_params, dimensions, approval_status)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'responsive', 'pending')`
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`
       ).run(
-        `crt_${crypto.randomUUID().slice(0, 10)}`,
+        creativeId,
         adId,
-        String(title).trim(),
-        String(description).trim(),
-        String(mediaUrl),
-        parsedUrl.toString(),
-        String(ctaText).trim() || 'Learn More',
-        String(trackingParams).trim()
+        title,
+        description,
+        resolvedMediaUrl,
+        destinationUrl,
+        ctaText,
+        trackingParams,
+        resolvedDimensions
       );
 
       if (violations.length > 0) {
@@ -378,6 +369,8 @@ export function createAdvertiserRouter(db: DatabaseSync): Router {
           `Automated review flag: ${violations.map((v) => `${v.categoryName} ("${v.matchedKeyword}")`).join('; ')}`
         );
       }
+
+      return creativeId;
     });
 
     res.status(201).json({ campaignId, status: 'pending_review', reviewFlags: violations });
@@ -519,11 +512,12 @@ export function createAdvertiserRouter(db: DatabaseSync): Router {
       return;
     }
 
-    const reason = String(req.body?.reason || '').trim();
-    if (reason.length < 10) {
-      res.status(400).json({ error: 'Please explain why this campaign complies with policy (at least 10 characters)' });
+    const appealValidation = validateAppealInput(req.body ?? {});
+    if (!appealValidation.valid || !appealValidation.value) {
+      res.status(400).json({ error: appealValidation.firstError, fieldErrors: appealValidation.errors });
       return;
     }
+    const { reason } = appealValidation.value;
 
     const camp = db
       .prepare('SELECT id, name, status, moderation_status FROM campaigns WHERE id = ? AND advertiser_id = ?')
@@ -572,7 +566,7 @@ export function createAdvertiserRouter(db: DatabaseSync): Router {
                 t.browsers_json, t.interest_categories_json, t.contextual_categories_json, t.retargeting_enabled, t.consent_required,
                 adv.id AS advertisement_id, adv.format AS ad_format,
                 crt.id AS creative_id, crt.title AS creative_title, crt.description AS creative_description,
-                crt.media_url, crt.destination_url, crt.cta_text, crt.tracking_params, crt.approval_status AS creative_approval_status,
+                crt.media_url, crt.destination_url, crt.cta_text, crt.tracking_params, crt.dimensions, crt.approval_status AS creative_approval_status,
                 (SELECT COUNT(*) FROM impressions i WHERE i.campaign_id = c.id AND i.is_valid = 1) AS impressions,
                 (SELECT COUNT(*) FROM clicks k WHERE k.campaign_id = c.id AND k.is_valid = 1) AS clicks,
                 (SELECT COUNT(*) FROM conversions v WHERE v.campaign_id = c.id AND v.is_valid = 1) AS conversions
@@ -602,8 +596,25 @@ export function createAdvertiserRouter(db: DatabaseSync): Router {
     }
 
     const existing = db
-      .prepare('SELECT id, moderation_status, status FROM campaigns WHERE id = ? AND advertiser_id = ?')
-      .get(String(req.params.id), advertiserId) as { id: string; moderation_status: string; status: string } | undefined;
+      .prepare(
+        `SELECT c.id, c.moderation_status, c.status, c.pricing_model, c.start_date, c.end_date,
+                b.daily_budget_micros, b.total_budget_micros
+         FROM campaigns c
+         JOIN campaign_budgets b ON b.campaign_id = c.id
+         WHERE c.id = ? AND c.advertiser_id = ?`
+      )
+      .get(String(req.params.id), advertiserId) as
+      | {
+          id: string;
+          moderation_status: string;
+          status: string;
+          pricing_model: string;
+          start_date: string;
+          end_date: string;
+          daily_budget_micros: number;
+          total_budget_micros: number;
+        }
+      | undefined;
 
     if (!existing) {
       res.status(404).json({ error: 'Campaign not found' });
@@ -613,6 +624,8 @@ export function createAdvertiserRouter(db: DatabaseSync): Router {
     const {
       status,
       name,
+      objective,
+      pricingModel,
       biddingStrategy,
       startDate,
       endDate,
@@ -621,6 +634,8 @@ export function createAdvertiserRouter(db: DatabaseSync): Router {
       maxBidUsd,
       pacingMode,
       targeting,
+      format,
+      dimensions,
       title,
       description,
       destinationUrl,
@@ -629,96 +644,227 @@ export function createAdvertiserRouter(db: DatabaseSync): Router {
       trackingParams,
     } = req.body ?? {};
 
-    if (status) {
+    const fieldErrors: Record<string, string> = {};
+
+    if (status !== undefined) {
       if (status === 'active' && existing.moderation_status !== 'approved') {
-        res.status(400).json({ error: 'Campaign must pass moderation approval before activation' });
-        return;
-      }
-      if (!['active', 'paused', 'archived'].includes(status)) {
-        res.status(400).json({ error: 'Invalid campaign status transition' });
-        return;
+        fieldErrors.status = 'Campaign must pass moderation approval before activation.';
+      } else if (!['active', 'paused', 'archived'].includes(String(status))) {
+        fieldErrors.status = 'Invalid campaign status transition.';
       }
     }
 
-    if (biddingStrategy && !['manual', 'auto_cpc', 'target_cpa'].includes(biddingStrategy)) {
-      res.status(400).json({ error: 'Invalid bidding strategy' });
-      return;
+    if (name !== undefined) {
+      const err = validateTextLength(name, { label: 'Campaign name', min: 2, max: 120 });
+      if (err) fieldErrors.name = err;
     }
-
-    if (pacingMode && !['standard', 'accelerated'].includes(pacingMode)) {
-      res.status(400).json({ error: 'Invalid pacing mode' });
-      return;
+    if (objective !== undefined && !(ALLOWED_OBJECTIVES as readonly string[]).includes(String(objective))) {
+      fieldErrors.objective = 'Select a valid advertising objective.';
     }
-
-    if (dailyBudgetUsd !== undefined && (!Number.isFinite(Number(dailyBudgetUsd)) || Number(dailyBudgetUsd) <= 0)) {
-      res.status(400).json({ error: 'dailyBudgetUsd must be a positive number' });
-      return;
+    if (pricingModel !== undefined && !(ALLOWED_PRICING_MODELS as readonly string[]).includes(String(pricingModel))) {
+      fieldErrors.pricingModel = 'Select a valid pricing model.';
     }
-    if (totalBudgetUsd !== undefined && (!Number.isFinite(Number(totalBudgetUsd)) || Number(totalBudgetUsd) <= 0)) {
-      res.status(400).json({ error: 'totalBudgetUsd must be a positive number' });
-      return;
+    if (biddingStrategy !== undefined && !(ALLOWED_BIDDING_STRATEGIES as readonly string[]).includes(String(biddingStrategy))) {
+      fieldErrors.biddingStrategy = 'Select a valid bidding strategy.';
     }
-    if (maxBidUsd !== undefined && (!Number.isFinite(Number(maxBidUsd)) || Number(maxBidUsd) <= 0)) {
-      res.status(400).json({ error: 'maxBidUsd must be a positive number' });
-      return;
+    if (pacingMode !== undefined && !(ALLOWED_PACING_MODES as readonly string[]).includes(String(pacingMode))) {
+      fieldErrors.pacingMode = 'Select a valid delivery pacing mode.';
+    }
+    if (format !== undefined && !(ALLOWED_AD_FORMATS as readonly string[]).includes(String(format))) {
+      fieldErrors.format = 'Select a valid ad format.';
+    }
+    if (dimensions !== undefined && dimensions !== '') {
+      const dimErr = validateDimensions(dimensions);
+      if (dimErr) fieldErrors.dimensions = dimErr;
+    }
+    if (title !== undefined) {
+      const err = validateTextLength(title, { label: 'Ad headline', min: 2, max: 120 });
+      if (err) fieldErrors.title = err;
+    }
+    if (description !== undefined) {
+      const err = validateTextLength(description, { label: 'Ad description', min: 4, max: 300, allowNewlines: true });
+      if (err) fieldErrors.description = err;
+    }
+    if (ctaText !== undefined) {
+      const err = validateTextLength(ctaText, { label: 'Call-to-action label', min: 1, max: 40 });
+      if (err) fieldErrors.ctaText = err;
+    }
+    if (trackingParams !== undefined && trackingParams !== '') {
+      const tStr = asTrimmedString(trackingParams);
+      if (tStr === null || tStr.length > 300 || /\s/.test(tStr)) {
+        fieldErrors.trackingParams = 'Tracking parameters must be 300 characters or fewer with no spaces.';
+      }
+    }
+    if (mediaUrl !== undefined && String(format ?? '') !== 'text') {
+      const mErr = validateMediaUrl(mediaUrl, false);
+      if (mErr) fieldErrors.mediaUrl = mErr;
     }
 
     let validatedDestUrl: string | undefined;
     if (destinationUrl !== undefined) {
-      try {
-        const parsed = new URL(String(destinationUrl));
-        if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
-          throw new Error('Invalid protocol');
+      const destErr = validateHttpUrl(destinationUrl, { label: 'Destination URL', required: true });
+      if (destErr) {
+        fieldErrors.destinationUrl = destErr;
+      } else {
+        validatedDestUrl = new URL(asTrimmedString(destinationUrl)!).toString();
+      }
+    }
+
+    const effectivePricing = pricingModel !== undefined ? String(pricingModel) : existing.pricing_model;
+    let nextDailyUsd = existing.daily_budget_micros / 1_000_000;
+    let nextTotalUsd = existing.total_budget_micros / 1_000_000;
+
+    if (dailyBudgetUsd !== undefined) {
+      const dRes = validateNumberRange(dailyBudgetUsd, { label: 'Daily budget', min: 5, max: 1_000_000, currency: true });
+      if (dRes.error) fieldErrors.dailyBudgetUsd = dRes.error;
+      else if (dRes.value !== null) nextDailyUsd = dRes.value;
+    }
+    if (totalBudgetUsd !== undefined) {
+      const tRes = validateNumberRange(totalBudgetUsd, { label: 'Total budget', min: 5, max: 50_000_000, currency: true });
+      if (tRes.error) fieldErrors.totalBudgetUsd = tRes.error;
+      else if (tRes.value !== null) nextTotalUsd = tRes.value;
+    }
+    if (maxBidUsd !== undefined) {
+      const bRes = validateNumberRange(maxBidUsd, { label: 'Max bid', min: 0.05, max: 10_000, currency: true });
+      if (bRes.error) fieldErrors.maxBidUsd = bRes.error;
+      else if (bRes.value !== null && bRes.value > nextDailyUsd && effectivePricing !== 'FIXED') {
+        fieldErrors.maxBidUsd = 'Max bid cannot exceed the daily budget cap.';
+      }
+    }
+    if (totalBudgetUsd !== undefined && !fieldErrors.dailyBudgetUsd && !fieldErrors.totalBudgetUsd && nextTotalUsd < nextDailyUsd) {
+      fieldErrors.totalBudgetUsd = 'Total budget must be greater than or equal to the daily budget.';
+    }
+
+    const effectiveStart = startDate !== undefined ? asTrimmedString(startDate) || '' : existing.start_date;
+    const effectiveEnd = endDate !== undefined ? asTrimmedString(endDate) || '' : existing.end_date;
+    if (startDate !== undefined) {
+      const sErr = validateIsoDate(startDate, 'Start date');
+      if (sErr) fieldErrors.startDate = sErr;
+    }
+    if (endDate !== undefined) {
+      const eErr = validateIsoDate(endDate, 'End date');
+      if (eErr) fieldErrors.endDate = eErr;
+    }
+    if ((startDate !== undefined || endDate !== undefined) && !fieldErrors.startDate && !fieldErrors.endDate && effectiveStart && effectiveEnd && effectiveEnd < effectiveStart) {
+      fieldErrors.endDate = 'End date must be on or after the start date.';
+    }
+
+    let validatedTargeting: ReturnType<typeof validateTargetingFields>['value'];
+    if (targeting !== undefined) {
+      if (!targeting || typeof targeting !== 'object' || Array.isArray(targeting)) {
+        fieldErrors.targeting = 'Targeting configuration must be an object.';
+      } else {
+        const tVal = validateTargetingFields(targeting as Record<string, unknown>);
+        if (!tVal.valid) {
+          Object.assign(fieldErrors, tVal.errors);
+        } else {
+          validatedTargeting = tVal.value;
         }
-        validatedDestUrl = parsed.toString();
-      } catch {
-        res.status(400).json({ error: 'Destination URL must be a valid http(s) URL' });
+      }
+    }
+
+    const firstErrKey = Object.keys(fieldErrors)[0];
+    if (firstErrKey) {
+      res.status(400).json({ error: fieldErrors[firstErrKey], fieldErrors });
+      return;
+    }
+
+    // Policy compliance scan when campaign name, creative copy, or destination URL is edited
+    let reviewFlags: Array<{ categoryId: string; categoryName: string; matchedKeyword: string; severity: 'block' | 'review' }> = [];
+    if (name !== undefined || title !== undefined || description !== undefined || validatedDestUrl !== undefined) {
+      const policyRows = db
+        .prepare('SELECT id, name, keywords_json, severity, active FROM prohibited_categories WHERE active = 1')
+        .all() as Array<{ id: string; name: string; keywords_json: string; severity: 'block' | 'review'; active: number }>;
+
+      const rules = policyRows.map((r) => ({
+        id: r.id,
+        name: r.name,
+        keywords: (() => {
+          try {
+            return JSON.parse(r.keywords_json) as string[];
+          } catch {
+            return [];
+          }
+        })(),
+        severity: r.severity,
+        active: Boolean(r.active),
+      }));
+
+      const violations = scanProhibitedContent(
+        `${name ?? ''} ${title ?? ''} ${description ?? ''} ${validatedDestUrl ?? ''}`,
+        rules
+      );
+      const blocking = violations.filter((v) => v.severity === 'block');
+      if (blocking.length > 0) {
+        res.status(422).json({
+          error: `Campaign update blocked by policy (${blocking[0].categoryName}): prohibited term "${blocking[0].matchedKeyword}" detected.`,
+          violations: blocking,
+        });
         return;
       }
+      reviewFlags = violations;
     }
 
     withTransaction(db, () => {
       if (status) {
         db.prepare("UPDATE campaigns SET status = ?, updated_at = datetime('now') WHERE id = ?").run(status, existing.id);
       }
-      if (name) {
+      if (name !== undefined && String(name).trim()) {
         db.prepare("UPDATE campaigns SET name = ?, updated_at = datetime('now') WHERE id = ?").run(String(name).trim(), existing.id);
+      }
+      if (objective !== undefined) {
+        db.prepare("UPDATE campaigns SET objective = ?, updated_at = datetime('now') WHERE id = ?").run(String(objective), existing.id);
+      }
+      if (pricingModel !== undefined) {
+        db.prepare("UPDATE campaigns SET pricing_model = ?, updated_at = datetime('now') WHERE id = ?").run(String(pricingModel), existing.id);
       }
       if (biddingStrategy) {
         db.prepare("UPDATE campaigns SET bidding_strategy = ?, updated_at = datetime('now') WHERE id = ?").run(biddingStrategy, existing.id);
       }
-      if (startDate && endDate) {
+      if (startDate !== undefined || endDate !== undefined) {
         db.prepare("UPDATE campaigns SET start_date = ?, end_date = ?, updated_at = datetime('now') WHERE id = ?").run(
-          String(startDate),
-          String(endDate),
+          effectiveStart,
+          effectiveEnd,
           existing.id
         );
       }
 
       if (dailyBudgetUsd !== undefined) {
-        const dailyMicros = Math.max(5_000_000, Math.round(Number(dailyBudgetUsd) * 1_000_000));
+        const dailyMicros = Math.round(nextDailyUsd * 1_000_000);
         db.prepare(
           "UPDATE campaign_budgets SET daily_budget_micros = ?, total_budget_micros = MAX(total_budget_micros, ?), updated_at = datetime('now') WHERE campaign_id = ?"
         ).run(dailyMicros, dailyMicros, existing.id);
       }
       if (totalBudgetUsd !== undefined) {
-        const currentBudget = db
-          .prepare('SELECT daily_budget_micros FROM campaign_budgets WHERE campaign_id = ?')
-          .get(existing.id) as { daily_budget_micros: number };
-        const totalMicros = Math.max(currentBudget.daily_budget_micros, Math.round(Number(totalBudgetUsd) * 1_000_000));
+        const totalMicros = Math.round(nextTotalUsd * 1_000_000);
         db.prepare("UPDATE campaign_budgets SET total_budget_micros = ?, updated_at = datetime('now') WHERE campaign_id = ?").run(totalMicros, existing.id);
       }
       if (maxBidUsd !== undefined) {
-        const bidMicros = Math.max(100_000, Math.round(Number(maxBidUsd) * 1_000_000));
+        const bidMicros = Math.round(Number(maxBidUsd) * 1_000_000);
         db.prepare("UPDATE campaign_budgets SET max_bid_micros = ?, updated_at = datetime('now') WHERE campaign_id = ?").run(bidMicros, existing.id);
       }
       if (pacingMode) {
         db.prepare("UPDATE campaign_budgets SET pacing_mode = ?, updated_at = datetime('now') WHERE campaign_id = ?").run(pacingMode, existing.id);
       }
 
-      if (title !== undefined || description !== undefined || validatedDestUrl !== undefined || ctaText !== undefined || mediaUrl !== undefined || trackingParams !== undefined) {
-        const adRow = db.prepare('SELECT id FROM advertisements WHERE campaign_id = ? LIMIT 1').get(existing.id) as { id: string } | undefined;
+      if (
+        format !== undefined ||
+        dimensions !== undefined ||
+        title !== undefined ||
+        description !== undefined ||
+        validatedDestUrl !== undefined ||
+        ctaText !== undefined ||
+        mediaUrl !== undefined ||
+        trackingParams !== undefined
+      ) {
+        const adRow = db.prepare('SELECT id, format FROM advertisements WHERE campaign_id = ? LIMIT 1').get(existing.id) as
+          | { id: string; format: string }
+          | undefined;
         if (adRow) {
+          const nextFormat = format !== undefined ? String(format) : adRow.format;
+          if (format !== undefined) {
+            db.prepare('UPDATE advertisements SET format = ? WHERE id = ?').run(nextFormat, adRow.id);
+          }
           if (title !== undefined) {
             db.prepare('UPDATE advertisements SET name = ? WHERE id = ?').run(String(title).trim(), adRow.id);
             db.prepare('UPDATE ad_creatives SET title = ? WHERE advertisement_id = ?').run(String(title).trim(), adRow.id);
@@ -732,19 +878,23 @@ export function createAdvertiserRouter(db: DatabaseSync): Router {
           if (ctaText !== undefined) {
             db.prepare('UPDATE ad_creatives SET cta_text = ? WHERE advertisement_id = ?').run(String(ctaText).trim() || 'Learn More', adRow.id);
           }
-          if (mediaUrl !== undefined) {
+          if (nextFormat === 'text') {
+            db.prepare("UPDATE ad_creatives SET media_url = '' WHERE advertisement_id = ?").run(adRow.id);
+          } else if (mediaUrl !== undefined) {
             db.prepare('UPDATE ad_creatives SET media_url = ? WHERE advertisement_id = ?').run(String(mediaUrl).trim(), adRow.id);
           }
           if (trackingParams !== undefined) {
             db.prepare('UPDATE ad_creatives SET tracking_params = ? WHERE advertisement_id = ?').run(String(trackingParams).trim(), adRow.id);
           }
+          if (dimensions !== undefined && String(dimensions).trim()) {
+            db.prepare('UPDATE ad_creatives SET dimensions = ? WHERE advertisement_id = ?').run(String(dimensions).trim().slice(0, 40), adRow.id);
+          } else if (format !== undefined && nextFormat === 'text') {
+            db.prepare("UPDATE ad_creatives SET dimensions = 'text' WHERE advertisement_id = ?").run(adRow.id);
+          }
         }
       }
 
-      if (targeting && typeof targeting === 'object') {
-        const sanitizeList = (arr: unknown, fallback: string[]) =>
-          Array.isArray(arr) && arr.length > 0 ? arr.map((v) => String(v).trim()).filter(Boolean) : fallback;
-
+      if (validatedTargeting && targeting && typeof targeting === 'object') {
         db.prepare(
           `UPDATE campaign_targeting
            SET countries_json = ?,
@@ -758,21 +908,33 @@ export function createAdvertiserRouter(db: DatabaseSync): Router {
                consent_required = ?
            WHERE campaign_id = ?`
         ).run(
-          JSON.stringify(sanitizeList(targeting.countries, ['ALL'])),
-          JSON.stringify(sanitizeList(targeting.languages, ['en'])),
-          JSON.stringify(sanitizeList(targeting.deviceCategories, ['desktop', 'mobile'])),
-          JSON.stringify(sanitizeList(targeting.operatingSystems, ['ALL'])),
-          JSON.stringify(sanitizeList(targeting.browsers, ['ALL'])),
-          JSON.stringify(sanitizeList(targeting.interestCategories, [])),
-          JSON.stringify(sanitizeList(targeting.contextualCategories, ['ALL'])),
+          JSON.stringify(validatedTargeting.countries),
+          JSON.stringify(validatedTargeting.languages),
+          JSON.stringify(validatedTargeting.deviceCategories),
+          JSON.stringify(validatedTargeting.operatingSystems),
+          JSON.stringify(validatedTargeting.browsers),
+          JSON.stringify(validatedTargeting.interestCategories),
+          JSON.stringify(validatedTargeting.contextualCategories),
           targeting.retargetingEnabled ? 1 : 0,
           targeting.consentRequired === false ? 0 : 1,
           existing.id
         );
       }
+
+      if (reviewFlags.length > 0) {
+        db.prepare(
+          `INSERT INTO moderation_reviews (id, target_type, target_id, reviewer_id, decision, reason)
+           VALUES (?, 'campaign', ?, ?, 'policy_flagged', ?)`
+        ).run(
+          `mod_${crypto.randomUUID().slice(0, 10)}`,
+          existing.id,
+          req.auth!.userId,
+          `Automated edit review flag: ${reviewFlags.map((v) => `${v.categoryName} ("${v.matchedKeyword}")`).join('; ')}`
+        );
+      }
     });
 
-    res.json({ updated: true, id: existing.id });
+    res.json({ updated: true, id: existing.id, reviewFlags });
   };
 
   router.patch('/campaigns/:id', handleUpdateCampaign);
@@ -1059,19 +1221,15 @@ export function createAdvertiserRouter(db: DatabaseSync): Router {
       return;
     }
 
-    const { amountUsd, provider = 'paystack', idempotencyKey } = req.body ?? {};
-    const parsedAmount = Number(amountUsd);
-    if (!Number.isFinite(parsedAmount) || parsedAmount < 10 || parsedAmount > 500000) {
-      res.status(400).json({ error: 'Deposit amount must be between $10 and $500,000' });
+    const depValidation = validateDepositInput(req.body ?? {});
+    if (!depValidation.valid || !depValidation.value) {
+      res.status(400).json({ error: depValidation.firstError, fieldErrors: depValidation.errors });
       return;
     }
-    if (!['paystack', 'flutterwave', 'stripe', 'bank_transfer'].includes(provider)) {
-      res.status(400).json({ error: 'Unsupported payment provider' });
-      return;
-    }
+    const { amountUsd: parsedAmount, provider, idempotencyKey } = depValidation.value;
 
     const amountMicros = Math.round(parsedAmount * 1_000_000);
-    const idem = typeof idempotencyKey === 'string' && idempotencyKey.length > 0 ? idempotencyKey : `dep_${crypto.randomUUID()}`;
+    const idem = idempotencyKey || `dep_${crypto.randomUUID()}`;
 
     const existing = db
       .prepare('SELECT id, advertiser_id, amount_micros, provider_ref, status FROM deposits WHERE idempotency_key = ?')
@@ -1196,12 +1354,12 @@ export function createAdvertiserRouter(db: DatabaseSync): Router {
       return;
     }
 
-    const { amountUsd, reason = 'Unused prepaid wallet balance withdrawal' } = req.body ?? {};
-    const parsedAmount = Number(amountUsd);
-    if (!Number.isFinite(parsedAmount) || parsedAmount < 5) {
-      res.status(400).json({ error: 'Refund amount must be at least $5.00' });
+    const refValidation = validateRefundInput(req.body ?? {});
+    if (!refValidation.valid || !refValidation.value) {
+      res.status(400).json({ error: refValidation.firstError, fieldErrors: refValidation.errors });
       return;
     }
+    const { amountUsd: parsedAmount, reason } = refValidation.value;
 
     const amountMicros = Math.round(parsedAmount * 1_000_000);
     const outcome = withTransaction(db, () => {

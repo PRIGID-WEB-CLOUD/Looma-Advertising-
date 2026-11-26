@@ -7,6 +7,13 @@ import { dispatchProviderPayout, queueTransactionalEmail } from '../security';
 import { runScheduledJob, type ScheduledJobName } from '../jobs';
 import { getFeatureFlags } from '../modules/featureFlags';
 import { getOperationalMonitoringSnapshot } from '../modules/monitoring';
+import {
+  isPlainObject,
+  validateNumberRange,
+  validatePlatformSettingsInput,
+  validateProhibitedCategoryInput,
+  validateTextLength,
+} from '../../src/lib/validation';
 
 export function createAdminRouter(db: DatabaseSync): Router {
   const router = Router();
@@ -78,10 +85,26 @@ export function createAdminRouter(db: DatabaseSync): Router {
       return;
     }
 
-    if (verificationStatus && ['pending', 'verified', 'rejected'].includes(verificationStatus)) {
+    const fieldErrors: Record<string, string> = {};
+    if (verificationStatus !== undefined && !['pending', 'verified', 'rejected'].includes(String(verificationStatus))) {
+      fieldErrors.verificationStatus = 'verificationStatus must be pending, verified, or rejected.';
+    }
+    if (accountStatus !== undefined && !['active', 'suspended'].includes(String(accountStatus))) {
+      fieldErrors.accountStatus = 'accountStatus must be active or suspended.';
+    }
+    if (verificationStatus === undefined && accountStatus === undefined) {
+      fieldErrors.verificationStatus = 'Provide verificationStatus or accountStatus to update.';
+    }
+    const firstKey = Object.keys(fieldErrors)[0];
+    if (firstKey) {
+      res.status(400).json({ error: fieldErrors[firstKey], fieldErrors });
+      return;
+    }
+
+    if (verificationStatus !== undefined) {
       db.prepare('UPDATE advertiser_accounts SET verification_status = ? WHERE id = ?').run(String(verificationStatus), advId);
     }
-    if (accountStatus && ['active', 'suspended'].includes(accountStatus)) {
+    if (accountStatus !== undefined) {
       db.prepare('UPDATE advertiser_accounts SET account_status = ? WHERE id = ?').run(String(accountStatus), advId);
     }
 
@@ -127,16 +150,39 @@ export function createAdminRouter(db: DatabaseSync): Router {
       return;
     }
 
-    if (approvalStatus && ['pending', 'approved', 'suspended'].includes(approvalStatus)) {
+    const fieldErrors: Record<string, string> = {};
+    if (approvalStatus !== undefined && !['pending', 'approved', 'suspended'].includes(String(approvalStatus))) {
+      fieldErrors.approvalStatus = 'approvalStatus must be pending, approved, or suspended.';
+    }
+    let validatedBps: number | null | undefined;
+    if (customRevenueShareBps !== undefined) {
+      if (customRevenueShareBps === null) {
+        validatedBps = null;
+      } else {
+        const bpsRes = validateNumberRange(customRevenueShareBps, {
+          label: 'Custom revenue share (bps)',
+          min: 1000,
+          max: 9500,
+          integer: true,
+        });
+        if (bpsRes.error) fieldErrors.customRevenueShareBps = bpsRes.error;
+        else validatedBps = bpsRes.value;
+      }
+    }
+    if (approvalStatus === undefined && customRevenueShareBps === undefined) {
+      fieldErrors.approvalStatus = 'Provide approvalStatus or customRevenueShareBps to update.';
+    }
+    const firstKey = Object.keys(fieldErrors)[0];
+    if (firstKey) {
+      res.status(400).json({ error: fieldErrors[firstKey], fieldErrors });
+      return;
+    }
+
+    if (approvalStatus !== undefined) {
       db.prepare('UPDATE publisher_accounts SET approval_status = ? WHERE id = ?').run(String(approvalStatus), pubId);
     }
-    if (customRevenueShareBps !== undefined) {
-      if (customRevenueShareBps !== null && !Number.isFinite(Number(customRevenueShareBps))) {
-        res.status(400).json({ error: 'customRevenueShareBps must be a number or null' });
-        return;
-      }
-      const bps = customRevenueShareBps === null ? null : Math.max(1000, Math.min(9500, Math.round(Number(customRevenueShareBps))));
-      db.prepare('UPDATE publisher_accounts SET custom_revenue_share_bps = ? WHERE id = ?').run(bps, pubId);
+    if (validatedBps !== undefined) {
+      db.prepare('UPDATE publisher_accounts SET custom_revenue_share_bps = ? WHERE id = ?').run(validatedBps, pubId);
     }
 
     db.prepare(
@@ -299,27 +345,19 @@ export function createAdminRouter(db: DatabaseSync): Router {
 
   // POST /api/admin/prohibited-categories
   router.post('/prohibited-categories', (req: AuthenticatedRequest, res: Response) => {
-    const { name, keywords, severity = 'block' } = req.body ?? {};
-    const cleanName = String(name || '').trim();
-    const keywordList = Array.isArray(keywords)
-      ? keywords.map((k) => String(k).trim()).filter(Boolean)
-      : String(keywords || '')
-          .split(',')
-          .map((k) => k.trim())
-          .filter(Boolean);
-
-    if (!cleanName || keywordList.length === 0) {
-      res.status(400).json({ error: 'Category name and at least one keyword are required' });
+    const validation = validateProhibitedCategoryInput(req.body ?? {});
+    if (!validation.valid || !validation.value) {
+      res.status(400).json({ error: validation.firstError, fieldErrors: validation.errors });
       return;
     }
-    if (!['block', 'review'].includes(severity)) {
-      res.status(400).json({ error: 'Severity must be block or review' });
-      return;
-    }
+    const { name: cleanName, keywords: keywordList, severity } = validation.value;
 
     const duplicate = db.prepare('SELECT id FROM prohibited_categories WHERE LOWER(name) = LOWER(?)').get(cleanName);
     if (duplicate) {
-      res.status(409).json({ error: 'A prohibited category with this name already exists' });
+      res.status(409).json({
+        error: 'A prohibited category with this name already exists',
+        fieldErrors: { name: 'A category with this name already exists.' },
+      });
       return;
     }
 
@@ -490,8 +528,28 @@ export function createAdminRouter(db: DatabaseSync): Router {
   // POST /api/admin/fraud/:id/resolve
   router.post('/fraud/:id/resolve', (req: AuthenticatedRequest, res: Response) => {
     const { status, resolutionNotes = '', deductMicros = 0 } = req.body ?? {};
-    if (!['confirmed_ivt', 'dismissed', 'investigating'].includes(status)) {
-      res.status(400).json({ error: 'Invalid fraud alert resolution status' });
+    const fieldErrors: Record<string, string> = {};
+    if (!['confirmed_ivt', 'dismissed', 'investigating'].includes(String(status))) {
+      fieldErrors.status = 'Status must be confirmed_ivt, dismissed, or investigating.';
+    }
+    const notesErr = validateTextLength(resolutionNotes, {
+      label: 'Resolution notes',
+      required: false,
+      min: 1,
+      max: 1000,
+      allowNewlines: true,
+    });
+    if (notesErr) fieldErrors.resolutionNotes = notesErr;
+    const deductRes = validateNumberRange(deductMicros, {
+      label: 'Clawback deduction (micros)',
+      min: 0,
+      max: 1_000_000_000_000,
+      integer: true,
+    });
+    if (deductRes.error) fieldErrors.deductMicros = deductRes.error;
+    const firstKey = Object.keys(fieldErrors)[0];
+    if (firstKey) {
+      res.status(400).json({ error: fieldErrors[firstKey], fieldErrors });
       return;
     }
 
@@ -703,10 +761,16 @@ export function createAdminRouter(db: DatabaseSync): Router {
   // PUT /api/admin/settings
   router.put('/settings', (req: AuthenticatedRequest, res: Response) => {
     const updates = req.body?.settings;
-    if (!updates || typeof updates !== 'object') {
-      res.status(400).json({ error: 'settings object is required' });
+    if (!isPlainObject(updates)) {
+      res.status(400).json({ error: 'settings object is required', fieldErrors: { settings: 'Provide a settings object.' } });
       return;
     }
+    const settingsValidation = validatePlatformSettingsInput(updates);
+    if (!settingsValidation.valid || !settingsValidation.value) {
+      res.status(400).json({ error: settingsValidation.firstError, fieldErrors: settingsValidation.errors });
+      return;
+    }
+    const validatedUpdates = settingsValidation.value;
 
     withTransaction(db, () => {
       const stmt = db.prepare(
@@ -714,14 +778,14 @@ export function createAdminRouter(db: DatabaseSync): Router {
          VALUES (?, ?, datetime('now'))
          ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = datetime('now')`
       );
-      for (const [k, v] of Object.entries(updates)) {
+      for (const [k, v] of Object.entries(validatedUpdates)) {
         stmt.run(k, JSON.stringify(v));
       }
 
       db.prepare(
         `INSERT INTO audit_logs (id, actor_user_id, action, resource_type, resource_id, details_json)
          VALUES (?, ?, 'update_platform_settings', 'platform_settings', 'global', ?)`
-      ).run(`aud_${crypto.randomUUID().slice(0, 10)}`, req.auth!.userId, JSON.stringify(updates));
+      ).run(`aud_${crypto.randomUUID().slice(0, 10)}`, req.auth!.userId, JSON.stringify(validatedUpdates));
     });
 
     res.json({ updated: true, featureFlags: getFeatureFlags(db) });

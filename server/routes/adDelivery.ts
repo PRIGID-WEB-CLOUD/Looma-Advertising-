@@ -23,6 +23,12 @@ import {
 } from '../modules/budgetReservations';
 import { getFeatureFlags, isPublisherEligibleForDelivery } from '../modules/featureFlags';
 import { recordAdDeliveryMetric, recordFraudBlockedMetric } from '../modules/monitoring';
+import {
+  asTrimmedString,
+  validateCountryCode,
+  validateNumberRange,
+  validateTextLength,
+} from '../../src/lib/validation';
 
 function parseJsonArray(raw: string, fallback: string[]): string[] {
   try {
@@ -119,8 +125,22 @@ export function createAdDeliveryRouter(db: DatabaseSync): Router {
       sessionId,
     } = req.body ?? {};
 
-    if (!placementId || typeof placementId !== 'string') {
-      res.status(400).json({ error: 'placementId is required' });
+    const cleanPlacementId = asTrimmedString(placementId);
+    if (!cleanPlacementId || cleanPlacementId.length > 80) {
+      res.status(400).json({ error: 'placementId is required', fieldErrors: { placementId: 'Provide a valid placementId.' } });
+      return;
+    }
+    const countryErr = validateCountryCode(country, true);
+    if (countryErr) {
+      res.status(400).json({ error: countryErr, fieldErrors: { country: countryErr } });
+      return;
+    }
+    const cleanDevice = asTrimmedString(deviceCategory)?.toLowerCase() || '';
+    if (!['desktop', 'mobile', 'tablet'].includes(cleanDevice)) {
+      res.status(400).json({
+        error: 'deviceCategory must be desktop, mobile, or tablet',
+        fieldErrors: { deviceCategory: 'deviceCategory must be desktop, mobile, or tablet.' },
+      });
       return;
     }
 
@@ -736,7 +756,21 @@ export function createAdDeliveryRouter(db: DatabaseSync): Router {
   router.post('/conversion', (req: Request, res: Response) => {
     const { conversionToken, eventName = 'purchase', conversionValueMicros = 0 } = req.body ?? {};
     if (!conversionToken || typeof conversionToken !== 'string') {
-      res.status(400).json({ error: 'conversionToken is required' });
+      res.status(400).json({ error: 'conversionToken is required', fieldErrors: { conversionToken: 'conversionToken is required.' } });
+      return;
+    }
+    const eventErr = validateTextLength(eventName, { label: 'Event name', min: 1, max: 64 });
+    if (eventErr) {
+      res.status(400).json({ error: eventErr, fieldErrors: { eventName: eventErr } });
+      return;
+    }
+    const valCheck = validateNumberRange(conversionValueMicros, {
+      label: 'Conversion value',
+      min: 0,
+      max: 1_000_000_000_000,
+    });
+    if (valCheck.error) {
+      res.status(400).json({ error: valCheck.error, fieldErrors: { conversionValueMicros: valCheck.error } });
       return;
     }
 
@@ -843,11 +877,20 @@ export function createAdDeliveryRouter(db: DatabaseSync): Router {
   router.post('/video-event', (req: Request, res: Response) => {
     const { videoToken, eventName = 'complete', watchedMs = 0 } = req.body ?? {};
     if (!videoToken || typeof videoToken !== 'string') {
-      res.status(400).json({ error: 'videoToken is required' });
+      res.status(400).json({ error: 'videoToken is required', fieldErrors: { videoToken: 'videoToken is required.' } });
       return;
     }
     if (!['start', 'first_quartile', 'midpoint', 'third_quartile', 'complete', 'mute', 'unmute'].includes(eventName)) {
-      res.status(400).json({ error: 'Invalid video eventName' });
+      res.status(400).json({ error: 'Invalid video eventName', fieldErrors: { eventName: 'Unsupported video event name.' } });
+      return;
+    }
+    const watchedCheck = validateNumberRange(watchedMs, {
+      label: 'Watched duration (ms)',
+      min: 0,
+      max: 86_400_000,
+    });
+    if (watchedCheck.error) {
+      res.status(400).json({ error: watchedCheck.error, fieldErrors: { watchedMs: watchedCheck.error } });
       return;
     }
 
@@ -938,7 +981,17 @@ export function createAdDeliveryRouter(db: DatabaseSync): Router {
   router.post('/install', (req: Request, res: Response) => {
     const { installToken, appBundleId = 'com.app.unknown', deviceOs = 'iOS' } = req.body ?? {};
     if (!installToken || typeof installToken !== 'string') {
-      res.status(400).json({ error: 'installToken is required' });
+      res.status(400).json({ error: 'installToken is required', fieldErrors: { installToken: 'installToken is required.' } });
+      return;
+    }
+    const bundleErr = validateTextLength(appBundleId, { label: 'App bundle ID', min: 3, max: 150 });
+    if (bundleErr) {
+      res.status(400).json({ error: bundleErr, fieldErrors: { appBundleId: bundleErr } });
+      return;
+    }
+    const osErr = validateTextLength(deviceOs, { label: 'Device OS', min: 2, max: 40 });
+    if (osErr) {
+      res.status(400).json({ error: osErr, fieldErrors: { deviceOs: osErr } });
       return;
     }
 

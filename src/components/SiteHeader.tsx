@@ -1,7 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { ArrowUpRight, Menu, Moon, ShieldCheck, Sun, X } from 'lucide-react';
-import type { UserRole } from '../lib/api';
-
+import { Menu, Moon, ShieldCheck, Sun, X } from 'lucide-react';
 import type { FooterPageSlug } from '../lib/footerRoutes';
 
 interface SiteHeaderProps {
@@ -9,7 +7,6 @@ interface SiteHeaderProps {
   activePage: FooterPageSlug | null;
   onToggleTheme: () => void;
   onOpenAuth: (mode: 'login' | 'register', role?: 'advertiser' | 'publisher') => void;
-  onQuickSandbox: (role: Extract<UserRole, 'advertiser' | 'publisher'>) => void;
   onOpenPrivacy: () => void;
   onNavigateHome: (sectionId?: string) => void;
 }
@@ -27,7 +24,6 @@ export const SiteHeader: React.FC<SiteHeaderProps> = ({
   activePage,
   onToggleTheme,
   onOpenAuth,
-  onQuickSandbox,
   onOpenPrivacy,
   onNavigateHome,
 }) => {
@@ -94,7 +90,7 @@ export const SiteHeader: React.FC<SiteHeaderProps> = ({
     >
       {/* Top Bar Contract: Zone 1 Brand Wordmark — Zone 2 5 single-line links — Zone 3 1 primary CTA */}
       <div className="max-w-7xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between gap-4 sm:gap-8">
-        {/* Zone 1: Brand Mark + Display Wordmark (single element, no subtitle or badge) */}
+        {/* Zone 1: Brand Mark + Display Wordmark (single element) */}
         <a
           href="/"
           onClick={(e) => {
@@ -165,10 +161,9 @@ export const SiteHeader: React.FC<SiteHeaderProps> = ({
               setMobileNavOpen(false);
               onOpenAuth('login', 'advertiser');
             }}
-            className="inline-flex items-center justify-center gap-1.5 px-4 py-2 text-xs sm:text-sm font-medium text-white bg-blue-700 hover:bg-blue-800 active:bg-blue-900 rounded-lg transition-colors duration-150 whitespace-nowrap shrink-0 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-700"
+            className="inline-flex items-center justify-center px-4 py-2 text-xs sm:text-sm font-medium text-white bg-blue-700 hover:bg-blue-800 active:bg-blue-900 rounded-lg transition-colors duration-150 whitespace-nowrap shrink-0 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-700"
           >
-            <span>Open Console</span>
-            <ArrowUpRight className="w-3.5 h-3.5 hidden sm:block" aria-hidden="true" />
+            Sign In
           </button>
 
           <button
@@ -219,21 +214,21 @@ export const SiteHeader: React.FC<SiteHeaderProps> = ({
               type="button"
               onClick={() => {
                 setMobileNavOpen(false);
-                onQuickSandbox('advertiser');
+                onOpenAuth('register', 'advertiser');
               }}
               className="px-3 py-2.5 text-xs font-medium text-slate-800 dark:text-slate-200 border border-slate-200 dark:border-slate-800 rounded-lg hover:bg-slate-50 dark:hover:bg-slate-900 text-center"
             >
-              Advertiser Console
+              Start Advertising
             </button>
             <button
               type="button"
               onClick={() => {
                 setMobileNavOpen(false);
-                onQuickSandbox('publisher');
+                onOpenAuth('register', 'publisher');
               }}
               className="px-3 py-2.5 text-xs font-medium text-slate-800 dark:text-slate-200 border border-slate-200 dark:border-slate-800 rounded-lg hover:bg-slate-50 dark:hover:bg-slate-900 text-center"
             >
-              Publisher Console
+              Join as Publisher
             </button>
           </div>
 

@@ -1,6 +1,8 @@
 import React, { useEffect, useState } from 'react';
 import { X } from 'lucide-react';
-import { apiRequest, AuthUser } from '../lib/api';
+import { apiRequest, AuthUser, extractFieldErrors } from '../lib/api';
+import { FieldError, fieldBorderClass } from './FieldError';
+import { type FieldErrors, validateContactInput, validatePrivacyRequestInput } from '../lib/validation';
 
 export type SupportPrivacyMode = 'privacy' | 'support';
 
@@ -28,11 +30,21 @@ export const SupportPrivacyModal: React.FC<SupportPrivacyModalProps> = ({ open, 
   const [submitting, setSubmitting] = useState(false);
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [fieldErrors, setFieldErrors] = useState<FieldErrors>({});
+
+  const clearFieldError = (key: string) =>
+    setFieldErrors((prev) => {
+      if (!prev[key]) return prev;
+      const next = { ...prev };
+      delete next[key];
+      return next;
+    });
 
   useEffect(() => {
     if (!open) return;
     setStatusMsg(null);
     setError(null);
+    setFieldErrors({});
     setPrivacyForm((prev) => ({ ...prev, email: user.email }));
     setSupportForm((prev) => ({
       ...prev,
@@ -52,17 +64,25 @@ export const SupportPrivacyModal: React.FC<SupportPrivacyModalProps> = ({ open, 
 
   async function handlePrivacySubmit(e: React.FormEvent) {
     e.preventDefault();
-    setSubmitting(true);
     setError(null);
     setStatusMsg(null);
+    setFieldErrors({});
+    const check = validatePrivacyRequestInput(privacyForm);
+    if (!check.valid) {
+      setFieldErrors(check.errors);
+      return;
+    }
+    setSubmitting(true);
     try {
       const res = await apiRequest<{ requestId: string }>('/api/public/privacy-request', {
         method: 'POST',
-        body: JSON.stringify(privacyForm),
+        body: JSON.stringify(check.value),
       });
       setStatusMsg(`Privacy request ${res.requestId} logged under ${privacyForm.jurisdiction} compliance workflow.`);
       setPrivacyForm((prev) => ({ ...prev, details: '' }));
     } catch (err) {
+      const fe = extractFieldErrors(err);
+      if (Object.keys(fe).length > 0) setFieldErrors(fe);
       setError(err instanceof Error ? err.message : 'Unable to submit privacy request');
     } finally {
       setSubmitting(false);
@@ -71,17 +91,25 @@ export const SupportPrivacyModal: React.FC<SupportPrivacyModalProps> = ({ open, 
 
   async function handleSupportSubmit(e: React.FormEvent) {
     e.preventDefault();
-    setSubmitting(true);
     setError(null);
     setStatusMsg(null);
+    setFieldErrors({});
+    const check = validateContactInput(supportForm);
+    if (!check.valid) {
+      setFieldErrors(check.errors);
+      return;
+    }
+    setSubmitting(true);
     try {
       const res = await apiRequest<{ inquiryId: string }>('/api/public/contact', {
         method: 'POST',
-        body: JSON.stringify(supportForm),
+        body: JSON.stringify(check.value),
       });
       setStatusMsg(`Support inquiry ${res.inquiryId} received by Looma Operations.`);
       setSupportForm((prev) => ({ ...prev, message: '' }));
     } catch (err) {
+      const fe = extractFieldErrors(err);
+      if (Object.keys(fe).length > 0) setFieldErrors(fe);
       setError(err instanceof Error ? err.message : 'Unable to send support inquiry');
     } finally {
       setSubmitting(false);
@@ -131,7 +159,7 @@ export const SupportPrivacyModal: React.FC<SupportPrivacyModalProps> = ({ open, 
           )}
 
           {mode === 'privacy' ? (
-            <form onSubmit={handlePrivacySubmit} className="space-y-3.5">
+            <form onSubmit={handlePrivacySubmit} noValidate className="space-y-3.5">
               <div>
                 <label htmlFor="prv-email" className="block text-xs font-medium mb-1">
                   Account Email
@@ -141,9 +169,15 @@ export const SupportPrivacyModal: React.FC<SupportPrivacyModalProps> = ({ open, 
                   type="email"
                   required
                   value={privacyForm.email}
-                  onChange={(e) => setPrivacyForm({ ...privacyForm, email: e.target.value })}
-                  className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
+                  onChange={(e) => {
+                    setPrivacyForm({ ...privacyForm, email: e.target.value });
+                    clearFieldError('email');
+                  }}
+                  aria-invalid={Boolean(fieldErrors.email)}
+                  aria-describedby={fieldErrors.email ? 'prv-email-err' : undefined}
+                  className={`w-full px-3 py-2 text-sm rounded-lg border ${fieldBorderClass(Boolean(fieldErrors.email))} bg-white dark:bg-slate-950`}
                 />
+                <FieldError id="prv-email-err" message={fieldErrors.email} />
               </div>
 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -154,13 +188,17 @@ export const SupportPrivacyModal: React.FC<SupportPrivacyModalProps> = ({ open, 
                   <select
                     id="prv-type"
                     value={privacyForm.requestType}
-                    onChange={(e) => setPrivacyForm({ ...privacyForm, requestType: e.target.value })}
-                    className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
+                    onChange={(e) => {
+                      setPrivacyForm({ ...privacyForm, requestType: e.target.value });
+                      clearFieldError('requestType');
+                    }}
+                    className={`w-full px-3 py-2 text-sm rounded-lg border ${fieldBorderClass(Boolean(fieldErrors.requestType))} bg-white dark:bg-slate-950`}
                   >
                     <option value="data_export">Data Export</option>
                     <option value="data_deletion">Data Deletion</option>
                     <option value="consent_withdrawal">Withdraw Consent</option>
                   </select>
+                  <FieldError id="prv-type-err" message={fieldErrors.requestType} />
                 </div>
                 <div>
                   <label htmlFor="prv-jur" className="block text-xs font-medium mb-1">
@@ -169,12 +207,16 @@ export const SupportPrivacyModal: React.FC<SupportPrivacyModalProps> = ({ open, 
                   <select
                     id="prv-jur"
                     value={privacyForm.jurisdiction}
-                    onChange={(e) => setPrivacyForm({ ...privacyForm, jurisdiction: e.target.value })}
-                    className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
+                    onChange={(e) => {
+                      setPrivacyForm({ ...privacyForm, jurisdiction: e.target.value });
+                      clearFieldError('jurisdiction');
+                    }}
+                    className={`w-full px-3 py-2 text-sm rounded-lg border ${fieldBorderClass(Boolean(fieldErrors.jurisdiction))} bg-white dark:bg-slate-950`}
                   >
                     <option value="GDPR">EU / UK GDPR</option>
                     <option value="CCPA">US State Privacy</option>
                   </select>
+                  <FieldError id="prv-jur-err" message={fieldErrors.jurisdiction} />
                 </div>
               </div>
 
@@ -186,10 +228,16 @@ export const SupportPrivacyModal: React.FC<SupportPrivacyModalProps> = ({ open, 
                   id="prv-details"
                   rows={3}
                   value={privacyForm.details}
-                  onChange={(e) => setPrivacyForm({ ...privacyForm, details: e.target.value })}
+                  onChange={(e) => {
+                    setPrivacyForm({ ...privacyForm, details: e.target.value });
+                    clearFieldError('details');
+                  }}
+                  aria-invalid={Boolean(fieldErrors.details)}
+                  aria-describedby={fieldErrors.details ? 'prv-details-err' : undefined}
                   placeholder="Specify scope or reference details"
-                  className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
+                  className={`w-full px-3 py-2 text-sm rounded-lg border ${fieldBorderClass(Boolean(fieldErrors.details))} bg-white dark:bg-slate-950`}
                 />
+                <FieldError id="prv-details-err" message={fieldErrors.details} />
               </div>
 
               <div className="pt-2 flex justify-end">
@@ -203,7 +251,7 @@ export const SupportPrivacyModal: React.FC<SupportPrivacyModalProps> = ({ open, 
               </div>
             </form>
           ) : (
-            <form onSubmit={handleSupportSubmit} className="space-y-3.5">
+            <form onSubmit={handleSupportSubmit} noValidate className="space-y-3.5">
               <div className="grid sm:grid-cols-2 gap-3">
                 <div>
                   <label htmlFor="sup-name" className="block text-xs font-medium mb-1">
@@ -214,9 +262,15 @@ export const SupportPrivacyModal: React.FC<SupportPrivacyModalProps> = ({ open, 
                     type="text"
                     required
                     value={supportForm.name}
-                    onChange={(e) => setSupportForm({ ...supportForm, name: e.target.value })}
-                    className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
+                    onChange={(e) => {
+                      setSupportForm({ ...supportForm, name: e.target.value });
+                      clearFieldError('name');
+                    }}
+                    aria-invalid={Boolean(fieldErrors.name)}
+                    aria-describedby={fieldErrors.name ? 'sup-name-err' : undefined}
+                    className={`w-full px-3 py-2 text-sm rounded-lg border ${fieldBorderClass(Boolean(fieldErrors.name))} bg-white dark:bg-slate-950`}
                   />
+                  <FieldError id="sup-name-err" message={fieldErrors.name} />
                 </div>
                 <div>
                   <label htmlFor="sup-email" className="block text-xs font-medium mb-1">
@@ -227,9 +281,15 @@ export const SupportPrivacyModal: React.FC<SupportPrivacyModalProps> = ({ open, 
                     type="email"
                     required
                     value={supportForm.email}
-                    onChange={(e) => setSupportForm({ ...supportForm, email: e.target.value })}
-                    className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
+                    onChange={(e) => {
+                      setSupportForm({ ...supportForm, email: e.target.value });
+                      clearFieldError('email');
+                    }}
+                    aria-invalid={Boolean(fieldErrors.email)}
+                    aria-describedby={fieldErrors.email ? 'sup-email-err' : undefined}
+                    className={`w-full px-3 py-2 text-sm rounded-lg border ${fieldBorderClass(Boolean(fieldErrors.email))} bg-white dark:bg-slate-950`}
                   />
+                  <FieldError id="sup-email-err" message={fieldErrors.email} />
                 </div>
               </div>
 
@@ -242,9 +302,15 @@ export const SupportPrivacyModal: React.FC<SupportPrivacyModalProps> = ({ open, 
                     id="sup-company"
                     type="text"
                     value={supportForm.company}
-                    onChange={(e) => setSupportForm({ ...supportForm, company: e.target.value })}
-                    className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
+                    onChange={(e) => {
+                      setSupportForm({ ...supportForm, company: e.target.value });
+                      clearFieldError('company');
+                    }}
+                    aria-invalid={Boolean(fieldErrors.company)}
+                    aria-describedby={fieldErrors.company ? 'sup-company-err' : undefined}
+                    className={`w-full px-3 py-2 text-sm rounded-lg border ${fieldBorderClass(Boolean(fieldErrors.company))} bg-white dark:bg-slate-950`}
                   />
+                  <FieldError id="sup-company-err" message={fieldErrors.company} />
                 </div>
                 <div>
                   <label htmlFor="sup-topic" className="block text-xs font-medium mb-1">
@@ -253,14 +319,18 @@ export const SupportPrivacyModal: React.FC<SupportPrivacyModalProps> = ({ open, 
                   <select
                     id="sup-topic"
                     value={supportForm.interest}
-                    onChange={(e) => setSupportForm({ ...supportForm, interest: e.target.value })}
-                    className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
+                    onChange={(e) => {
+                      setSupportForm({ ...supportForm, interest: e.target.value });
+                      clearFieldError('interest');
+                    }}
+                    className={`w-full px-3 py-2 text-sm rounded-lg border ${fieldBorderClass(Boolean(fieldErrors.interest))} bg-white dark:bg-slate-950`}
                   >
                     <option value="advertising">Campaigns & Delivery</option>
                     <option value="publisher_monetization">Publisher SDK & Payouts</option>
                     <option value="billing">Billing & Reconciliation</option>
                     <option value="compliance">Policy & Moderation</option>
                   </select>
+                  <FieldError id="sup-topic-err" message={fieldErrors.interest} />
                 </div>
               </div>
 
@@ -273,10 +343,16 @@ export const SupportPrivacyModal: React.FC<SupportPrivacyModalProps> = ({ open, 
                   rows={3}
                   required
                   value={supportForm.message}
-                  onChange={(e) => setSupportForm({ ...supportForm, message: e.target.value })}
+                  onChange={(e) => {
+                    setSupportForm({ ...supportForm, message: e.target.value });
+                    clearFieldError('message');
+                  }}
+                  aria-invalid={Boolean(fieldErrors.message)}
+                  aria-describedby={fieldErrors.message ? 'sup-msg-err' : undefined}
                   placeholder="Describe your request, campaign ID, or placement ID"
-                  className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
+                  className={`w-full px-3 py-2 text-sm rounded-lg border ${fieldBorderClass(Boolean(fieldErrors.message))} bg-white dark:bg-slate-950`}
                 />
+                <FieldError id="sup-msg-err" message={fieldErrors.message} />
               </div>
 
               <div className="pt-2 flex justify-end">

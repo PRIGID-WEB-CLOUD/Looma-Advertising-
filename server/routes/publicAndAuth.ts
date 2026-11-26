@@ -24,6 +24,21 @@ import {
 } from '../security';
 import { getFeatureFlags } from '../modules/featureFlags';
 import { recordWebhookMetric } from '../modules/monitoring';
+import {
+  asTrimmedString,
+  validateAdminClaimInput,
+  validateContactInput,
+  validateForgotPasswordInput,
+  validateLoginInput,
+  validateNumberRange,
+  validatePreferencesInput,
+  validatePrivacyRequestInput,
+  validateProfileUpdateInput,
+  validateRegisterInput,
+  validateResetPasswordInput,
+  validateSecuritySettingsInput,
+  validateSixDigitCode,
+} from '../../src/lib/validation';
 
 function sha256Hex(value: string): string {
   return crypto.createHash('sha256').update(value).digest('hex');
@@ -100,20 +115,17 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
       res.status(429).json({ error: 'Too many inquiries submitted. Please try again shortly.' });
       return;
     }
-    const { name, email, company = '', interest = 'advertising', message } = req.body ?? {};
-    if (!name || !email || !message) {
-      res.status(400).json({ error: 'Name, email, and message are required' });
+    const validation = validateContactInput(req.body ?? {});
+    if (!validation.valid || !validation.value) {
+      res.status(400).json({ error: validation.firstError, fieldErrors: validation.errors });
       return;
     }
-    if (!String(email).includes('@')) {
-      res.status(400).json({ error: 'Please provide a valid email address' });
-      return;
-    }
+    const { name, email, company, interest, message } = validation.value;
 
     const id = `inq_${crypto.randomUUID().slice(0, 10)}`;
     db.prepare(
       `INSERT INTO contact_inquiries (id, name, email, company, interest, message) VALUES (?, ?, ?, ?, ?, ?)`
-    ).run(id, String(name).trim(), String(email).trim(), String(company).trim(), String(interest), String(message).trim());
+    ).run(id, name, email, company, interest, message);
 
     res.status(201).json({ received: true, inquiryId: id });
   });
@@ -124,20 +136,17 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
       res.status(429).json({ error: 'Too many privacy requests submitted. Please try again shortly.' });
       return;
     }
-    const { email, requestType = 'data_export', jurisdiction = 'GDPR', details = '' } = req.body ?? {};
-    if (!email || !String(email).includes('@')) {
-      res.status(400).json({ error: 'Valid email is required' });
+    const validation = validatePrivacyRequestInput(req.body ?? {});
+    if (!validation.valid || !validation.value) {
+      res.status(400).json({ error: validation.firstError, fieldErrors: validation.errors });
       return;
     }
-    if (!['data_export', 'data_deletion', 'consent_withdrawal'].includes(requestType)) {
-      res.status(400).json({ error: 'Invalid privacy request type' });
-      return;
-    }
+    const { email, requestType, jurisdiction, details } = validation.value;
 
     const id = `prv_${crypto.randomUUID().slice(0, 10)}`;
     db.prepare(
       `INSERT INTO privacy_requests (id, email, request_type, jurisdiction, details) VALUES (?, ?, ?, ?, ?)`
-    ).run(id, String(email).trim(), String(requestType), String(jurisdiction), String(details).trim());
+    ).run(id, email, requestType, jurisdiction, details);
 
     res.status(201).json({ submitted: true, requestId: id });
   });
@@ -165,17 +174,12 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
       return;
     }
 
-    const { email, fullName = 'Platform Administrator', password } = req.body ?? {};
-    const normalizedEmail = String(email || '').trim().toLowerCase();
-    const cleanName = String(fullName || 'Platform Administrator').trim();
-    if (!normalizedEmail || !normalizedEmail.includes('@')) {
-      res.status(400).json({ error: 'A valid administrator email address is required' });
+    const claimValidation = validateAdminClaimInput(req.body ?? {});
+    if (!claimValidation.valid || !claimValidation.value) {
+      res.status(400).json({ error: claimValidation.firstError, fieldErrors: claimValidation.errors });
       return;
     }
-    if (!password || String(password).length < 10) {
-      res.status(400).json({ error: 'Administrator password must be at least 10 characters' });
-      return;
-    }
+    const { email: normalizedEmail, fullName: cleanName, password } = claimValidation.value;
 
     const existingOther = db
       .prepare("SELECT id FROM users WHERE email = ? AND id != 'usr_admin_1'")
@@ -242,19 +246,12 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
       res.status(429).json({ error: 'Too many registration attempts. Please try again later.' });
       return;
     }
-    const { email, fullName, password, role = 'advertiser', organizationName, country = 'US' } = req.body ?? {};
-    if (!email || !fullName || !password || !organizationName) {
-      res.status(400).json({ error: 'Email, full name, password, and organization name are required' });
+    const regValidation = validateRegisterInput(req.body ?? {});
+    if (!regValidation.valid || !regValidation.value) {
+      res.status(400).json({ error: regValidation.firstError, fieldErrors: regValidation.errors });
       return;
     }
-    if (String(password).length < 8) {
-      res.status(400).json({ error: 'Password must be at least 8 characters' });
-      return;
-    }
-    if (!['advertiser', 'publisher'].includes(role)) {
-      res.status(400).json({ error: 'Self-registration is available for advertiser or publisher accounts' });
-      return;
-    }
+    const { email: normalizedEmail, fullName, password, role, organizationName, country } = regValidation.value;
     if (role === 'publisher' && !getFeatureFlags(db).external_publisher_registration_enabled) {
       res.status(403).json({
         error:
@@ -263,7 +260,6 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
       return;
     }
 
-    const normalizedEmail = String(email).trim().toLowerCase();
     const existing = db.prepare('SELECT id FROM users WHERE email = ?').get(normalizedEmail);
     if (existing) {
       res.status(409).json({ error: 'An account with this email already exists' });
@@ -317,11 +313,12 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
       res.status(429).json({ error: 'Too many sign-in attempts. Please wait a minute and try again.' });
       return;
     }
-    const { email, password, totpCode } = req.body ?? {};
-    if (!email || !password) {
-      res.status(400).json({ error: 'Email and password are required' });
+    const loginValidation = validateLoginInput(req.body ?? {});
+    if (!loginValidation.valid || !loginValidation.value) {
+      res.status(400).json({ error: loginValidation.firstError, fieldErrors: loginValidation.errors });
       return;
     }
+    const { email, password, totpCode } = loginValidation.value;
 
     const row = db
       .prepare(
@@ -330,7 +327,7 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
          JOIN roles r ON r.id = u.role_id
          WHERE u.email = ?`
       )
-      .get(String(email).trim().toLowerCase()) as
+      .get(email) as
       | {
           id: string;
           email: string;
@@ -436,11 +433,12 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
 
   // POST /api/auth/verify-email
   router.post('/auth/verify-email', requireAuth, (req: AuthenticatedRequest, res: Response) => {
-    const code = String(req.body?.code || '').trim();
-    if (!code) {
-      res.status(400).json({ error: 'Verification code is required' });
+    const codeErr = validateSixDigitCode(req.body?.code, 'Verification code');
+    if (codeErr) {
+      res.status(400).json({ error: codeErr, fieldErrors: { code: codeErr } });
       return;
     }
+    const code = asTrimmedString(req.body?.code) || '';
     const tokenHash = sha256Hex(code);
     const tokenRow = db
       .prepare(
@@ -470,11 +468,12 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
       res.status(429).json({ error: 'Too many password reset requests. Please try again later.' });
       return;
     }
-    const normalizedEmail = String(req.body?.email || '').trim().toLowerCase();
-    if (!normalizedEmail || !normalizedEmail.includes('@')) {
-      res.status(400).json({ error: 'Valid email address is required' });
+    const forgotValidation = validateForgotPasswordInput(req.body ?? {});
+    if (!forgotValidation.valid || !forgotValidation.value) {
+      res.status(400).json({ error: forgotValidation.firstError, fieldErrors: forgotValidation.errors });
       return;
     }
+    const normalizedEmail = forgotValidation.value.email;
 
     const user = db.prepare('SELECT id, email, status FROM users WHERE email = ?').get(normalizedEmail) as
       | { id: string; email: string; status: string }
@@ -508,18 +507,12 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
       res.status(429).json({ error: 'Too many password reset attempts. Please try again later.' });
       return;
     }
-    const { email, token, newPassword } = req.body ?? {};
-    const normalizedEmail = String(email || '').trim().toLowerCase();
-    const cleanToken = String(token || '').trim().toUpperCase();
-
-    if (!normalizedEmail || !cleanToken || !newPassword) {
-      res.status(400).json({ error: 'Email, reset code, and new password are required' });
+    const resetValidation = validateResetPasswordInput(req.body ?? {});
+    if (!resetValidation.valid || !resetValidation.value) {
+      res.status(400).json({ error: resetValidation.firstError, fieldErrors: resetValidation.errors });
       return;
     }
-    if (String(newPassword).length < 8) {
-      res.status(400).json({ error: 'New password must be at least 8 characters' });
-      return;
-    }
+    const { email: normalizedEmail, token: cleanToken, newPassword } = resetValidation.value;
 
     const user = db.prepare('SELECT id FROM users WHERE email = ?').get(normalizedEmail) as { id: string } | undefined;
     if (!user) {
@@ -577,7 +570,12 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
 
   // POST /api/auth/2fa/verify
   router.post('/auth/2fa/verify', requireAuth, (req: AuthenticatedRequest, res: Response) => {
-    const code = String(req.body?.code || '').trim();
+    const codeErr = validateSixDigitCode(req.body?.code, 'Authenticator code');
+    if (codeErr) {
+      res.status(400).json({ error: codeErr, fieldErrors: { code: codeErr } });
+      return;
+    }
+    const code = asTrimmedString(req.body?.code) || '';
     const row = db.prepare('SELECT secret_base32 FROM totp_secrets WHERE user_id = ?').get(req.auth!.userId) as
       | { secret_base32: string }
       | undefined;
@@ -586,7 +584,7 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
       return;
     }
     if (!verifyTotpCode(row.secret_base32, code)) {
-      res.status(400).json({ error: 'Invalid 6-digit authenticator code' });
+      res.status(400).json({ error: 'Invalid 6-digit authenticator code', fieldErrors: { code: 'Invalid or expired 6-digit code.' } });
       return;
     }
 
@@ -748,12 +746,13 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
 
   // PATCH /api/auth/profile
   router.patch('/auth/profile', requireAuth, (req: AuthenticatedRequest, res: Response) => {
-    const { fullName, organizationName, country, contactEmail } = req.body ?? {};
-    const cleanName = String(fullName ?? '').trim();
-    if (!cleanName || cleanName.length < 2) {
-      res.status(400).json({ error: 'Full name must be at least 2 characters' });
+    const profileValidation = validateProfileUpdateInput(req.body ?? {});
+    if (!profileValidation.valid || !profileValidation.value) {
+      res.status(400).json({ error: profileValidation.firstError, fieldErrors: profileValidation.errors });
       return;
     }
+    const { fullName: cleanName, organizationName: cleanOrg, country: cleanCountry, contactEmail: cleanBilling } =
+      profileValidation.value;
 
     const userId = req.auth!.userId;
     const role = req.auth!.role;
@@ -762,17 +761,12 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
       db.prepare(`UPDATE users SET full_name = ?, updated_at = datetime('now') WHERE id = ?`).run(cleanName, userId);
 
       if (role === 'advertiser') {
-        const cleanOrg = String(organizationName ?? '').trim();
-        const cleanCountry = String(country ?? 'US').trim().toUpperCase().slice(0, 4) || 'US';
-        const cleanBilling = String(contactEmail ?? '').trim();
         if (cleanOrg) {
           db.prepare(
             `UPDATE advertiser_accounts SET company_name = ?, country = ?, billing_email = COALESCE(NULLIF(?, ''), billing_email) WHERE user_id = ?`
           ).run(cleanOrg, cleanCountry, cleanBilling, userId);
         }
       } else if (role === 'publisher') {
-        const cleanOrg = String(organizationName ?? '').trim();
-        const cleanCountry = String(country ?? 'US').trim().toUpperCase().slice(0, 4) || 'US';
         if (cleanOrg) {
           db.prepare(
             `UPDATE publisher_accounts SET organization_name = ?, country = ? WHERE user_id = ?`
@@ -789,31 +783,30 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
 
   // PATCH /api/auth/settings
   router.patch('/auth/settings', requireAuth, (req: AuthenticatedRequest, res: Response) => {
-    const { twoFactorEnabled, sessionTimeoutMinutes, currentPassword, newPassword } = req.body ?? {};
-    const userId = req.auth!.userId;
-    const timeout = Number(sessionTimeoutMinutes ?? 60);
-    if (!Number.isFinite(timeout) || timeout < 15 || timeout > 1440) {
-      res.status(400).json({ error: 'Session timeout must be between 15 and 1440 minutes' });
+    const settingsValidation = validateSecuritySettingsInput(req.body ?? {});
+    if (!settingsValidation.valid || !settingsValidation.value) {
+      res.status(400).json({ error: settingsValidation.firstError, fieldErrors: settingsValidation.errors });
       return;
     }
+    const { twoFactorEnabled, sessionTimeoutMinutes: timeout, currentPassword, newPassword } = settingsValidation.value;
+    const userId = req.auth!.userId;
 
     let refreshedToken: string | undefined;
     if (newPassword) {
-      if (String(newPassword).length < 8) {
-        res.status(400).json({ error: 'New password must be at least 8 characters' });
-        return;
-      }
       const userRow = db.prepare('SELECT password_hash, email FROM users WHERE id = ?').get(userId) as
         | { password_hash: string; email: string }
         | undefined;
-      if (!userRow || !currentPassword || !verifyPassword(String(currentPassword), userRow.password_hash)) {
-        res.status(400).json({ error: 'Current password is incorrect' });
+      if (!userRow || !currentPassword || !verifyPassword(currentPassword, userRow.password_hash)) {
+        res.status(400).json({
+          error: 'Current password is incorrect',
+          fieldErrors: { currentPassword: 'Current password is incorrect.' },
+        });
         return;
       }
       const invalidatedAt = Date.now() + 1;
       db.prepare(
         `UPDATE users SET password_hash = ?, token_valid_after = ?, updated_at = datetime('now') WHERE id = ?`
-      ).run(hashPassword(String(newPassword)), invalidatedAt, userId);
+      ).run(hashPassword(newPassword), invalidatedAt, userId);
       if (req.rawToken && req.auth) {
         revokeSessionToken(db, req.rawToken, req.auth.exp);
       }
@@ -835,14 +828,14 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
 
   // PATCH /api/auth/preferences
   router.patch('/auth/preferences', requireAuth, (req: AuthenticatedRequest, res: Response) => {
-    const { timezone, preferredCurrency, compactDensity, emailAlerts, fraudAlerts, weeklyDigest } = req.body ?? {};
-    const userId = req.auth!.userId;
-    const cleanTz = String(timezone ?? 'UTC').trim() || 'UTC';
-    const cleanCurr = String(preferredCurrency ?? 'USD').trim().toUpperCase();
-    if (!['USD', 'EUR', 'GBP', 'CAD', 'NGN', 'KES'].includes(cleanCurr)) {
-      res.status(400).json({ error: 'Unsupported display currency' });
+    const prefsValidation = validatePreferencesInput(req.body ?? {});
+    if (!prefsValidation.valid || !prefsValidation.value) {
+      res.status(400).json({ error: prefsValidation.firstError, fieldErrors: prefsValidation.errors });
       return;
     }
+    const { timezone: cleanTz, preferredCurrency: cleanCurr, compactDensity, emailAlerts, fraudAlerts, weeklyDigest } =
+      prefsValidation.value;
+    const userId = req.auth!.userId;
 
     getOrCreatePrefs(userId);
     db.prepare(
@@ -915,16 +908,17 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
     }
 
     const { eventId, advertiserId, amountUsd, eventType = 'charge.success' } = req.body ?? {};
-    if (!eventId || !advertiserId || !amountUsd) {
-      res.status(400).json({ error: 'eventId, advertiserId, and amountUsd are required' });
+    const cleanEventId = asTrimmedString(eventId);
+    const cleanAdvertiserId = asTrimmedString(advertiserId);
+    const amountCheck = validateNumberRange(amountUsd, { label: 'Webhook amount', min: 0.01, max: 1_000_000, currency: true });
+    if (!cleanEventId || !cleanAdvertiserId || amountCheck.error || amountCheck.value === null) {
+      res.status(400).json({
+        error: amountCheck.error || 'eventId, advertiserId, and a valid positive amountUsd are required',
+      });
       return;
     }
 
-    const amountMicros = Math.round(Number(amountUsd) * 1_000_000);
-    if (amountMicros <= 0) {
-      res.status(400).json({ error: 'Invalid webhook amount' });
-      return;
-    }
+    const amountMicros = Math.round(amountCheck.value * 1_000_000);
 
     try {
       const outcome = withTransaction(db, () => {

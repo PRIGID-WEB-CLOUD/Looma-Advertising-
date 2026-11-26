@@ -3,7 +3,7 @@ import type { DatabaseSync } from 'node:sqlite';
 export interface PlatformFeatureFlags {
   /** Looma is the exclusive active first-party publisher at initial launch. */
   looma_first_party_only_mode: boolean;
-  /** External third-party publisher self-registration (disabled at initial launch). */
+  /** External third-party publisher self-registration (enabled for publisher onboarding; accounts start pending admin approval). */
   external_publisher_registration_enabled: boolean;
   /** External third-party SDK distribution (disabled until expansion phase). */
   third_party_sdk_distribution_enabled: boolean;
@@ -17,7 +17,7 @@ export interface PlatformFeatureFlags {
 
 export const INITIAL_LAUNCH_FEATURE_FLAGS: PlatformFeatureFlags = {
   looma_first_party_only_mode: true,
-  external_publisher_registration_enabled: false,
+  external_publisher_registration_enabled: true,
   third_party_sdk_distribution_enabled: false,
   third_party_revenue_allocation_enabled: false,
   third_party_publisher_payouts_enabled: false,

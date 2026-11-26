@@ -139,8 +139,18 @@ async function startServer() {
   // Always return JSON errors for API routes instead of Express HTML error pages
   app.use((err: unknown, req: express.Request, res: express.Response, next: express.NextFunction) => {
     if (req.path.startsWith('/api') || req.path.startsWith('/sdk')) {
+      const errObj = err as { type?: string; status?: number; statusCode?: number; message?: string };
+      if (errObj?.type === 'entity.parse.failed' || err instanceof SyntaxError) {
+        res.status(400).json({ error: 'Invalid JSON request payload' });
+        return;
+      }
+      if (errObj?.type === 'entity.too.large' || errObj?.status === 413) {
+        res.status(413).json({ error: 'Request payload exceeds maximum allowed size' });
+        return;
+      }
+      const status = typeof errObj?.status === 'number' && errObj.status >= 400 && errObj.status < 600 ? errObj.status : 500;
       const message = err instanceof Error ? err.message : 'Internal server error';
-      res.status(500).json({ error: message });
+      res.status(status).json({ error: message });
       return;
     }
     next(err);

@@ -23,7 +23,7 @@ test('Initial launch feature flags keep Looma first-party exclusive and disable 
 
   const flags = getFeatureFlags(db);
   assert.equal(flags.looma_first_party_only_mode, true);
-  assert.equal(flags.external_publisher_registration_enabled, false);
+  assert.equal(flags.external_publisher_registration_enabled, true);
   assert.equal(flags.third_party_sdk_distribution_enabled, false);
   assert.equal(flags.third_party_revenue_allocation_enabled, false);
   assert.equal(flags.third_party_publisher_payouts_enabled, false);

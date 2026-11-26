@@ -8,7 +8,7 @@
     "build": "vite build",
     "start": "NODE_ENV=production tsx server.ts",
     "lint": "tsc --noEmit",
-    "test": "tsx --test server/engine.test.ts server/integration.test.ts server/modules/modules.test.ts server/httpCrud.test.ts src/lib/footerRoutes.test.ts"
+    "test": "tsx --test server/engine.test.ts server/integration.test.ts server/modules/modules.test.ts server/httpCrud.test.ts server/validation.http.test.ts src/lib/footerRoutes.test.ts src/lib/adFormats.test.ts src/lib/validation.test.ts"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.5",

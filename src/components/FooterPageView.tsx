@@ -1,6 +1,8 @@
 import React, { useEffect, useState } from 'react';
 import { ArrowLeft, ArrowRight, Check, Copy } from 'lucide-react';
-import { apiRequest, formatMicros, UserRole } from '../lib/api';
+import { apiRequest, extractFieldErrors, formatMicros, UserRole } from '../lib/api';
+import { FieldErrors, validateContactInput, validatePrivacyRequestInput } from '../lib/validation';
+import { FieldError, fieldBorderClass } from './FieldError';
 import {
   FOOTER_PAGES,
   FooterPageCategory,
@@ -142,6 +144,7 @@ export const FooterPageView: React.FC<FooterPageViewProps> = ({
   });
   const [privacyStatus, setPrivacyStatus] = useState<string | null>(null);
   const [privacyError, setPrivacyError] = useState<string | null>(null);
+  const [privacyFieldErrors, setPrivacyFieldErrors] = useState<FieldErrors>({});
   const [privacySubmitting, setPrivacySubmitting] = useState(false);
 
   // Live Contact Engineering & Commercial form state
@@ -154,7 +157,26 @@ export const FooterPageView: React.FC<FooterPageViewProps> = ({
   });
   const [contactStatus, setContactStatus] = useState<string | null>(null);
   const [contactError, setContactError] = useState<string | null>(null);
+  const [contactFieldErrors, setContactFieldErrors] = useState<FieldErrors>({});
   const [contactSubmitting, setContactSubmitting] = useState(false);
+
+  const clearPrivacyError = (field: string) => {
+    setPrivacyFieldErrors((prev) => {
+      if (!prev[field]) return prev;
+      const next = { ...prev };
+      delete next[field];
+      return next;
+    });
+  };
+
+  const clearContactError = (field: string) => {
+    setContactFieldErrors((prev) => {
+      if (!prev[field]) return prev;
+      const next = { ...prev };
+      delete next[field];
+      return next;
+    });
+  };
 
   useEffect(() => {
     if (slug === 'integration-contract' && !contractData) {
@@ -195,6 +217,12 @@ export const FooterPageView: React.FC<FooterPageViewProps> = ({
     e.preventDefault();
     setPrivacyStatus(null);
     setPrivacyError(null);
+    const check = validatePrivacyRequestInput(privacyForm);
+    if (!check.valid) {
+      setPrivacyFieldErrors(check.errors);
+      return;
+    }
+    setPrivacyFieldErrors({});
     setPrivacySubmitting(true);
     try {
       const res = await apiRequest<{ requestId: string }>('/api/public/privacy-request', {
@@ -206,6 +234,8 @@ export const FooterPageView: React.FC<FooterPageViewProps> = ({
       );
       setPrivacyForm({ email: '', requestType: 'data_export', jurisdiction: 'GDPR', details: '' });
     } catch (err) {
+      const serverFields = extractFieldErrors(err);
+      if (Object.keys(serverFields).length > 0) setPrivacyFieldErrors(serverFields);
       setPrivacyError(err instanceof Error ? err.message : 'Unable to submit privacy request');
     } finally {
       setPrivacySubmitting(false);
@@ -216,6 +246,12 @@ export const FooterPageView: React.FC<FooterPageViewProps> = ({
     e.preventDefault();
     setContactError(null);
     setContactStatus(null);
+    const check = validateContactInput(contactForm);
+    if (!check.valid) {
+      setContactFieldErrors(check.errors);
+      return;
+    }
+    setContactFieldErrors({});
     setContactSubmitting(true);
     try {
       const res = await apiRequest<{ inquiryId: string }>('/api/public/contact', {
@@ -227,6 +263,8 @@ export const FooterPageView: React.FC<FooterPageViewProps> = ({
       );
       setContactForm({ name: '', email: '', company: '', interest: 'advertising', message: '' });
     } catch (err) {
+      const serverFields = extractFieldErrors(err);
+      if (Object.keys(serverFields).length > 0) setContactFieldErrors(serverFields);
       setContactError(err instanceof Error ? err.message : 'Unable to submit inquiry');
     } finally {
       setContactSubmitting(false);
@@ -849,6 +887,7 @@ export const FooterPageView: React.FC<FooterPageViewProps> = ({
 
               <form
                 onSubmit={handleContactSubmit}
+                noValidate
                 className="p-5 sm:p-8 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 space-y-4"
               >
                 {contactStatus && (
@@ -872,10 +911,16 @@ export const FooterPageView: React.FC<FooterPageViewProps> = ({
                       type="text"
                       required
                       value={contactForm.name}
-                      onChange={(e) => setContactForm({ ...contactForm, name: e.target.value })}
+                      onChange={(e) => {
+                        setContactForm({ ...contactForm, name: e.target.value });
+                        clearContactError('name');
+                      }}
+                      aria-invalid={Boolean(contactFieldErrors.name)}
+                      aria-describedby={contactFieldErrors.name ? 'fp-contact-name-err' : undefined}
                       placeholder="Amara Okafor"
-                      className="w-full px-3.5 py-2.5 text-sm rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
+                      className={`w-full px-3.5 py-2.5 text-sm rounded-lg border bg-white dark:bg-slate-950 ${fieldBorderClass(Boolean(contactFieldErrors.name))}`}
                     />
+                    <FieldError id="fp-contact-name-err" message={contactFieldErrors.name} />
                   </div>
                   <div>
                     <label htmlFor="fp-contact-email" className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">
@@ -886,10 +931,16 @@ export const FooterPageView: React.FC<FooterPageViewProps> = ({
                       type="email"
                       required
                       value={contactForm.email}
-                      onChange={(e) => setContactForm({ ...contactForm, email: e.target.value })}
+                      onChange={(e) => {
+                        setContactForm({ ...contactForm, email: e.target.value });
+                        clearContactError('email');
+                      }}
+                      aria-invalid={Boolean(contactFieldErrors.email)}
+                      aria-describedby={contactFieldErrors.email ? 'fp-contact-email-err' : undefined}
                       placeholder="amara@company.com"
-                      className="w-full px-3.5 py-2.5 text-sm rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
+                      className={`w-full px-3.5 py-2.5 text-sm rounded-lg border bg-white dark:bg-slate-950 ${fieldBorderClass(Boolean(contactFieldErrors.email))}`}
                     />
+                    <FieldError id="fp-contact-email-err" message={contactFieldErrors.email} />
                   </div>
                 </div>
 
@@ -902,10 +953,16 @@ export const FooterPageView: React.FC<FooterPageViewProps> = ({
                       id="fp-contact-company"
                       type="text"
                       value={contactForm.company}
-                      onChange={(e) => setContactForm({ ...contactForm, company: e.target.value })}
+                      onChange={(e) => {
+                        setContactForm({ ...contactForm, company: e.target.value });
+                        clearContactError('company');
+                      }}
+                      aria-invalid={Boolean(contactFieldErrors.company)}
+                      aria-describedby={contactFieldErrors.company ? 'fp-contact-company-err' : undefined}
                       placeholder="Atlas Commerce Global"
-                      className="w-full px-3.5 py-2.5 text-sm rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
+                      className={`w-full px-3.5 py-2.5 text-sm rounded-lg border bg-white dark:bg-slate-950 ${fieldBorderClass(Boolean(contactFieldErrors.company))}`}
                     />
+                    <FieldError id="fp-contact-company-err" message={contactFieldErrors.company} />
                   </div>
                   <div>
                     <label htmlFor="fp-contact-interest" className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">
@@ -914,14 +971,18 @@ export const FooterPageView: React.FC<FooterPageViewProps> = ({
                     <select
                       id="fp-contact-interest"
                       value={contactForm.interest}
-                      onChange={(e) => setContactForm({ ...contactForm, interest: e.target.value })}
-                      className="w-full px-3.5 py-2.5 text-sm rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
+                      onChange={(e) => {
+                        setContactForm({ ...contactForm, interest: e.target.value });
+                        clearContactError('interest');
+                      }}
+                      className={`w-full px-3.5 py-2.5 text-sm rounded-lg border bg-white dark:bg-slate-950 ${fieldBorderClass(Boolean(contactFieldErrors.interest))}`}
                     >
                       <option value="advertising">Enterprise Advertising</option>
                       <option value="engineering">SDK &amp; Integration Engineering</option>
                       <option value="compliance">Privacy &amp; Compliance</option>
                       <option value="billing">Prepaid Billing &amp; Settlements</option>
                     </select>
+                    <FieldError message={contactFieldErrors.interest} />
                   </div>
                 </div>
 
@@ -934,10 +995,16 @@ export const FooterPageView: React.FC<FooterPageViewProps> = ({
                     rows={4}
                     required
                     value={contactForm.message}
-                    onChange={(e) => setContactForm({ ...contactForm, message: e.target.value })}
+                    onChange={(e) => {
+                      setContactForm({ ...contactForm, message: e.target.value });
+                      clearContactError('message');
+                    }}
+                    aria-invalid={Boolean(contactFieldErrors.message)}
+                    aria-describedby={contactFieldErrors.message ? 'fp-contact-message-err' : undefined}
                     placeholder="Share integration requirements, campaign volume, or billing reconciliation questions."
-                    className="w-full px-3.5 py-2.5 text-sm rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
+                    className={`w-full px-3.5 py-2.5 text-sm rounded-lg border bg-white dark:bg-slate-950 ${fieldBorderClass(Boolean(contactFieldErrors.message))}`}
                   />
+                  <FieldError id="fp-contact-message-err" message={contactFieldErrors.message} />
                 </div>
 
                 <div className="pt-1 flex justify-end">
@@ -964,6 +1031,7 @@ export const FooterPageView: React.FC<FooterPageViewProps> = ({
 
               <form
                 onSubmit={handlePrivacySubmit}
+                noValidate
                 className="p-5 sm:p-8 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 space-y-4"
               >
                 {privacyError && (
@@ -986,10 +1054,16 @@ export const FooterPageView: React.FC<FooterPageViewProps> = ({
                     type="email"
                     required
                     value={privacyForm.email}
-                    onChange={(e) => setPrivacyForm({ ...privacyForm, email: e.target.value })}
+                    onChange={(e) => {
+                      setPrivacyForm({ ...privacyForm, email: e.target.value });
+                      clearPrivacyError('email');
+                    }}
+                    aria-invalid={Boolean(privacyFieldErrors.email)}
+                    aria-describedby={privacyFieldErrors.email ? 'fp-prv-email-err' : undefined}
                     placeholder="name@company.com"
-                    className="w-full px-3.5 py-2.5 text-sm rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
+                    className={`w-full px-3.5 py-2.5 text-sm rounded-lg border bg-white dark:bg-slate-950 ${fieldBorderClass(Boolean(privacyFieldErrors.email))}`}
                   />
+                  <FieldError id="fp-prv-email-err" message={privacyFieldErrors.email} />
                 </div>
 
                 <div className="grid sm:grid-cols-2 gap-4">
@@ -1000,14 +1074,18 @@ export const FooterPageView: React.FC<FooterPageViewProps> = ({
                     <select
                       id="fp-prv-type"
                       value={privacyForm.requestType}
-                      onChange={(e) => setPrivacyForm({ ...privacyForm, requestType: e.target.value })}
-                      className="w-full px-3.5 py-2.5 text-sm rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
+                      onChange={(e) => {
+                        setPrivacyForm({ ...privacyForm, requestType: e.target.value });
+                        clearPrivacyError('requestType');
+                      }}
+                      className={`w-full px-3.5 py-2.5 text-sm rounded-lg border bg-white dark:bg-slate-950 ${fieldBorderClass(Boolean(privacyFieldErrors.requestType))}`}
                     >
                       <option value="data_export">Data Export (Access / Portability)</option>
                       <option value="data_deletion">Data Deletion (Erasure)</option>
                       <option value="consent_withdrawal">Consent Withdrawal</option>
                       <option value="rectification">Data Rectification</option>
                     </select>
+                    <FieldError message={privacyFieldErrors.requestType} />
                   </div>
                   <div>
                     <label htmlFor="fp-prv-jurisdiction" className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">
@@ -1016,8 +1094,11 @@ export const FooterPageView: React.FC<FooterPageViewProps> = ({
                     <select
                       id="fp-prv-jurisdiction"
                       value={privacyForm.jurisdiction}
-                      onChange={(e) => setPrivacyForm({ ...privacyForm, jurisdiction: e.target.value })}
-                      className="w-full px-3.5 py-2.5 text-sm rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
+                      onChange={(e) => {
+                        setPrivacyForm({ ...privacyForm, jurisdiction: e.target.value });
+                        clearPrivacyError('jurisdiction');
+                      }}
+                      className={`w-full px-3.5 py-2.5 text-sm rounded-lg border bg-white dark:bg-slate-950 ${fieldBorderClass(Boolean(privacyFieldErrors.jurisdiction))}`}
                     >
                       <option value="GDPR">EU / EEA (GDPR)</option>
                       <option value="UK_GDPR">United Kingdom (UK GDPR)</option>
@@ -1025,6 +1106,7 @@ export const FooterPageView: React.FC<FooterPageViewProps> = ({
                       <option value="NDPA">Nigeria (NDPA)</option>
                       <option value="OTHER">Other Jurisdiction</option>
                     </select>
+                    <FieldError message={privacyFieldErrors.jurisdiction} />
                   </div>
                 </div>
 
@@ -1036,10 +1118,16 @@ export const FooterPageView: React.FC<FooterPageViewProps> = ({
                     id="fp-prv-details"
                     rows={3}
                     value={privacyForm.details}
-                    onChange={(e) => setPrivacyForm({ ...privacyForm, details: e.target.value })}
+                    onChange={(e) => {
+                      setPrivacyForm({ ...privacyForm, details: e.target.value });
+                      clearPrivacyError('details');
+                    }}
+                    aria-invalid={Boolean(privacyFieldErrors.details)}
+                    aria-describedby={privacyFieldErrors.details ? 'fp-prv-details-err' : undefined}
                     placeholder="Specify advertiser account ID, date range, or specific records."
-                    className="w-full px-3.5 py-2.5 text-sm rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
+                    className={`w-full px-3.5 py-2.5 text-sm rounded-lg border bg-white dark:bg-slate-950 ${fieldBorderClass(Boolean(privacyFieldErrors.details))}`}
                   />
+                  <FieldError id="fp-prv-details-err" message={privacyFieldErrors.details} />
                 </div>
 
                 <div className="pt-1 flex justify-end">

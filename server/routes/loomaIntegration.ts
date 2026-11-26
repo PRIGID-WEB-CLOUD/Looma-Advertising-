@@ -11,6 +11,12 @@ import {
   type LoomaFeedSlotRequest,
 } from '../modules/loomaAdapter';
 import { recordAdDeliveryMetric, recordSsoMetric } from '../modules/monitoring';
+import {
+  asTrimmedString,
+  validateCountryCode,
+  validateEmail,
+  validateTextLength,
+} from '../../src/lib/validation';
 
 export function createLoomaIntegrationRouter(db: DatabaseSync): Router {
   const router = Router();
@@ -85,17 +91,31 @@ export function createLoomaIntegrationRouter(db: DatabaseSync): Router {
       country = 'US',
     } = req.body ?? {};
 
+    const emailErr = validateEmail(email);
+    const nameErr = validateTextLength(fullName, { label: 'Full name', min: 2, max: 100 });
+    const bizErr = validateTextLength(businessName, { label: 'Business name', min: 2, max: 120 });
+    const countryErr = validateCountryCode(country, true);
+    if (emailErr || nameErr || bizErr || countryErr) {
+      const fieldErrors: Record<string, string> = {};
+      if (emailErr) fieldErrors.email = emailErr;
+      if (nameErr) fieldErrors.fullName = nameErr;
+      if (bizErr) fieldErrors.businessName = bizErr;
+      if (countryErr) fieldErrors.country = countryErr;
+      res.status(400).json({ error: Object.values(fieldErrors)[0], fieldErrors });
+      return;
+    }
+
     const assertion = signLoomaSsoAssertion({
-      loomaUserId: String(loomaUserId),
-      email: String(email),
-      fullName: String(fullName),
-      businessId: String(businessId),
-      businessName: String(businessName),
+      loomaUserId: String(loomaUserId).trim().slice(0, 100),
+      email: String(email).trim().toLowerCase(),
+      fullName: String(fullName).trim(),
+      businessId: String(businessId).trim().slice(0, 100),
+      businessName: String(businessName).trim(),
       membershipRole: ['owner', 'admin', 'ad_manager', 'viewer'].includes(String(membershipRole))
         ? (String(membershipRole) as 'owner' | 'admin' | 'ad_manager' | 'viewer')
         : 'owner',
       verifiedMembership: Boolean(verifiedMembership),
-      country: String(country),
+      country: String(country).trim().toUpperCase(),
     });
 
     res.json({ assertion, issuer: 'looma-core', audience: 'looma-ads', expiresInSeconds: 180 });
@@ -103,10 +123,13 @@ export function createLoomaIntegrationRouter(db: DatabaseSync): Router {
 
   // POST /api/v1/looma/sso/exchange — Cryptographically verified Looma SSO + business membership exchange
   router.post('/sso/exchange', (req: Request, res: Response) => {
-    const assertion = String(req.body?.assertion || '').trim();
-    if (!assertion) {
+    const assertion = asTrimmedString(req.body?.assertion) || '';
+    if (!assertion || assertion.length > 4096) {
       recordSsoMetric(false);
-      res.status(400).json({ error: 'Signed Looma SSO assertion is required' });
+      res.status(400).json({
+        error: 'Signed Looma SSO assertion is required',
+        fieldErrors: { assertion: 'Paste a valid signed Looma SSO assertion token.' },
+      });
       return;
     }
 
@@ -156,16 +179,29 @@ export function createLoomaIntegrationRouter(db: DatabaseSync): Router {
       sessionId = '',
     } = req.body ?? {};
 
+    const fieldErrors: Record<string, string> = {};
+    const countryErr = validateCountryCode(country, true);
+    if (countryErr) fieldErrors.country = countryErr;
+
+    const cleanDevice = asTrimmedString(deviceCategory)?.toLowerCase() || '';
+    if (!['desktop', 'mobile', 'tablet'].includes(cleanDevice)) {
+      fieldErrors.deviceCategory = 'deviceCategory must be desktop, mobile, or tablet.';
+    }
+    if (slots !== undefined && !Array.isArray(slots)) {
+      fieldErrors.slots = 'slots must be an array.';
+    } else if (Array.isArray(slots) && slots.length > 10) {
+      fieldErrors.slots = 'Maximum 10 slots per request.';
+    }
+
     let normalizedSlots: LoomaFeedSlotRequest[] = [];
     if (Array.isArray(slots) && slots.length > 0) {
       normalizedSlots = slots
-        .slice(0, 10)
         .map((s: Record<string, unknown>, idx: number) => ({
-          slotIndex: Number.isFinite(Number(s?.slotIndex)) ? Number(s.slotIndex) : idx,
-          placementId: String(s?.placementId || '').trim(),
+          slotIndex: Number.isFinite(Number(s?.slotIndex)) && Number(s?.slotIndex) >= 0 ? Math.floor(Number(s.slotIndex)) : idx,
+          placementId: asTrimmedString(s?.placementId) || '',
         }))
-        .filter((s) => s.placementId.length > 0);
-    } else {
+        .filter((s) => s.placementId.length > 0 && s.placementId.length <= 80);
+    } else if (slots === undefined) {
       const defaultPlacements = db
         .prepare(
           `SELECT ap.id
@@ -182,8 +218,12 @@ export function createLoomaIntegrationRouter(db: DatabaseSync): Router {
       }));
     }
 
-    if (normalizedSlots.length === 0) {
-      res.status(400).json({ error: 'At least one valid Looma placement slot is required' });
+    if (!fieldErrors.slots && normalizedSlots.length === 0) {
+      fieldErrors.slots = 'Provide at least one placementId.';
+    }
+
+    if (Object.keys(fieldErrors).length > 0) {
+      res.status(400).json({ error: Object.values(fieldErrors)[0], fieldErrors });
       return;
     }
 

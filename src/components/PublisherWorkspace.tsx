@@ -1,8 +1,16 @@
 import React, { useEffect, useState } from 'react';
-import { Plus, CheckCircle2, MousePointerClick, Sparkles, AlertTriangle } from 'lucide-react';
-import { apiRequest, formatMicros, formatNumber, formatPct } from '../lib/api';
+import { Plus, CheckCircle2, MousePointerClick, Sparkles, AlertTriangle, X } from 'lucide-react';
+import { apiRequest, extractFieldErrors, formatMicros, formatNumber, formatPct } from '../lib/api';
 import { fetchLoomaFeedAds, type LoomaFeedFetchResult } from '../lib/loomaFeedClient';
 import { PerformanceChart } from './Charts';
+import { FieldError, fieldBorderClass } from './FieldError';
+import {
+  type FieldErrors,
+  validatePayoutMethodInput,
+  validatePlacementCreateInput,
+  validatePropertyCreateInput,
+  validateWithdrawalInput,
+} from '../lib/validation';
 
 interface PublisherOverview {
   account: {
@@ -116,6 +124,34 @@ export const PublisherWorkspace: React.FC<PublisherWorkspaceProps> = ({ activeTa
   const [payoutMethodType, setPayoutMethodType] = useState('bank_transfer');
   const [payoutDestination, setPayoutDestination] = useState('');
 
+  // Field-level inline validation states
+  const [propErrors, setPropErrors] = useState<FieldErrors>({});
+  const [placeErrors, setPlaceErrors] = useState<FieldErrors>({});
+  const [withdrawErrors, setWithdrawErrors] = useState<FieldErrors>({});
+  const [payoutErrors, setPayoutErrors] = useState<FieldErrors>({});
+
+  const clearPropError = (key: string) =>
+    setPropErrors((prev) => {
+      if (!prev[key]) return prev;
+      const next = { ...prev };
+      delete next[key];
+      return next;
+    });
+  const clearPlaceError = (key: string) =>
+    setPlaceErrors((prev) => {
+      if (!prev[key]) return prev;
+      const next = { ...prev };
+      delete next[key];
+      return next;
+    });
+  const clearPayoutError = (key: string) =>
+    setPayoutErrors((prev) => {
+      if (!prev[key]) return prev;
+      const next = { ...prev };
+      delete next[key];
+      return next;
+    });
+
   // Integration Center & Live Ad Delivery Sandbox
   const [sdkDocTab, setSdkDocTab] = useState<'web' | 'rest' | 'android' | 'ios'>('web');
   const [sandboxConfig, setSandboxConfig] = useState({
@@ -188,19 +224,42 @@ export const PublisherWorkspace: React.FC<PublisherWorkspaceProps> = ({ activeTa
     loadAll();
   }, []);
 
+  useEffect(() => {
+    setActionMsg(null);
+    setError(null);
+    setPropErrors({});
+    setPlaceErrors({});
+    setWithdrawErrors({});
+    setPayoutErrors({});
+  }, [tab]);
+
+  useEffect(() => {
+    if (!actionMsg) return;
+    const timer = window.setTimeout(() => setActionMsg(null), 5000);
+    return () => window.clearTimeout(timer);
+  }, [actionMsg]);
+
   async function handleAddProperty(e: React.FormEvent) {
     e.preventDefault();
     setError(null);
     setActionMsg(null);
+    setPropErrors({});
+    const check = validatePropertyCreateInput(propForm);
+    if (!check.valid) {
+      setPropErrors(check.errors);
+      return;
+    }
     try {
       const res = await apiRequest<{ propertyId: string; verificationToken: string }>('/api/publisher/properties', {
         method: 'POST',
-        body: JSON.stringify(propForm),
+        body: JSON.stringify(check.value),
       });
       setActionMsg(`Property ${res.propertyId} registered. Token: ${res.verificationToken}`);
       setPropForm({ ...propForm, name: '', domainOrBundle: '' });
       await loadAll();
     } catch (err) {
+      const fe = extractFieldErrors(err);
+      if (Object.keys(fe).length > 0) setPropErrors(fe);
       setError(err instanceof Error ? err.message : 'Failed to register property');
     }
   }
@@ -233,15 +292,23 @@ export const PublisherWorkspace: React.FC<PublisherWorkspaceProps> = ({ activeTa
     e.preventDefault();
     setError(null);
     setActionMsg(null);
+    setPlaceErrors({});
+    const check = validatePlacementCreateInput(placeForm);
+    if (!check.valid) {
+      setPlaceErrors(check.errors);
+      return;
+    }
     try {
       const res = await apiRequest<{ placementId: string }>('/api/publisher/placements', {
         method: 'POST',
-        body: JSON.stringify(placeForm),
+        body: JSON.stringify(check.value),
       });
       setActionMsg(`Placement ${res.placementId} created and ready for SDK integration.`);
       setPlaceForm({ ...placeForm, name: '' });
       await loadAll();
     } catch (err) {
+      const fe = extractFieldErrors(err);
+      if (Object.keys(fe).length > 0) setPlaceErrors(fe);
       setError(err instanceof Error ? err.message : 'Failed to create placement');
     }
   }
@@ -259,14 +326,26 @@ export const PublisherWorkspace: React.FC<PublisherWorkspaceProps> = ({ activeTa
     e.preventDefault();
     setError(null);
     setActionMsg(null);
+    setWithdrawErrors({});
+    const check = validateWithdrawalInput({
+      amountUsd: withdrawUsd,
+      minPayoutUsd: earnings ? earnings.minPayoutMicros / 1_000_000 : 50,
+      maxAvailableUsd: earnings ? earnings.wallet.available_micros / 1_000_000 : undefined,
+    });
+    if (!check.valid) {
+      setWithdrawErrors(check.errors);
+      return;
+    }
     try {
       const res = await apiRequest<{ withdrawalId: string }>('/api/publisher/withdraw', {
         method: 'POST',
-        body: JSON.stringify({ amountUsd: Number(withdrawUsd) }),
+        body: JSON.stringify({ amountUsd: check.value!.amountUsd }),
       });
       setActionMsg(`Withdrawal ${res.withdrawalId} queued for finance approval.`);
       await loadAll();
     } catch (err) {
+      const fe = extractFieldErrors(err);
+      if (Object.keys(fe).length > 0) setWithdrawErrors(fe);
       setError(err instanceof Error ? err.message : 'Withdrawal request failed');
     }
   }
@@ -274,14 +353,22 @@ export const PublisherWorkspace: React.FC<PublisherWorkspaceProps> = ({ activeTa
   async function handleSavePayoutMethod(e: React.FormEvent) {
     e.preventDefault();
     setError(null);
+    setPayoutErrors({});
+    const check = validatePayoutMethodInput({ payoutMethodType, payoutDestination });
+    if (!check.valid) {
+      setPayoutErrors(check.errors);
+      return;
+    }
     try {
       await apiRequest('/api/publisher/payout-method', {
         method: 'PATCH',
-        body: JSON.stringify({ payoutMethodType, payoutDestination }),
+        body: JSON.stringify(check.value),
       });
       setActionMsg('Payout destination updated.');
       await loadAll();
     } catch (err) {
+      const fe = extractFieldErrors(err);
+      if (Object.keys(fe).length > 0) setPayoutErrors(fe);
       setError(err instanceof Error ? err.message : 'Failed to update payout method');
     }
   }
@@ -501,13 +588,29 @@ export const PublisherWorkspace: React.FC<PublisherWorkspaceProps> = ({ activeTa
       </div>
 
       {error && (
-        <div className="p-3.5 rounded-lg border border-red-200 dark:border-red-900 bg-red-50 dark:bg-red-950/40 text-sm text-red-700 dark:text-red-300">
-          {error}
+        <div className="p-3.5 rounded-lg border border-red-200 dark:border-red-900 bg-red-50 dark:bg-red-950/40 text-sm text-red-700 dark:text-red-300 flex items-start justify-between gap-3">
+          <span>{error}</span>
+          <button
+            type="button"
+            onClick={() => setError(null)}
+            aria-label="Dismiss error"
+            className="p-0.5 rounded hover:bg-red-100 dark:hover:bg-red-900/40 shrink-0"
+          >
+            <X className="w-4 h-4" />
+          </button>
         </div>
       )}
       {actionMsg && (
-        <div className="p-3.5 rounded-lg border border-emerald-200 dark:border-emerald-900 bg-emerald-50 dark:bg-emerald-950/40 text-sm text-emerald-800 dark:text-emerald-200">
-          {actionMsg}
+        <div className="p-3.5 rounded-lg border border-emerald-200 dark:border-emerald-900 bg-emerald-50 dark:bg-emerald-950/40 text-sm text-emerald-800 dark:text-emerald-200 flex items-start justify-between gap-3">
+          <span>{actionMsg}</span>
+          <button
+            type="button"
+            onClick={() => setActionMsg(null)}
+            aria-label="Dismiss notification"
+            className="p-0.5 rounded hover:bg-emerald-100 dark:hover:bg-emerald-900/40 shrink-0"
+          >
+            <X className="w-4 h-4" />
+          </button>
         </div>
       )}
 
@@ -577,69 +680,110 @@ export const PublisherWorkspace: React.FC<PublisherWorkspaceProps> = ({ activeTa
         <div className="grid lg:grid-cols-12 gap-6 items-start">
           <form
             onSubmit={handleAddProperty}
+            noValidate
             className="lg:col-span-4 min-w-0 border border-slate-200 dark:border-slate-800 rounded-xl p-4 sm:p-5 bg-white dark:bg-slate-900 space-y-3.5"
           >
             <h2 className="text-base font-semibold">Register Website or App</h2>
             <div>
-              <label className="block text-xs font-medium mb-1">Property Type</label>
+              <label htmlFor="pub-prop-type" className="block text-xs font-medium mb-1">Property Type</label>
               <select
+                id="pub-prop-type"
                 value={propForm.propertyType}
-                onChange={(e) => setPropForm({ ...propForm, propertyType: e.target.value })}
-                className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
+                onChange={(e) => {
+                  setPropForm({ ...propForm, propertyType: e.target.value });
+                  clearPropError('propertyType');
+                  clearPropError('domainOrBundle');
+                }}
+                aria-invalid={Boolean(propErrors.propertyType)}
+                aria-describedby={propErrors.propertyType ? 'pub-prop-type-err' : undefined}
+                className={`w-full px-3 py-2 text-sm rounded-lg border ${fieldBorderClass(Boolean(propErrors.propertyType))} bg-white dark:bg-slate-950`}
               >
                 <option value="website">Website</option>
                 <option value="web_app">Web Application</option>
                 <option value="ios_app">iOS Application</option>
                 <option value="android_app">Android Application</option>
               </select>
+              <FieldError id="pub-prop-type-err" message={propErrors.propertyType} />
             </div>
             <div>
-              <label className="block text-xs font-medium mb-1">Property Name</label>
+              <label htmlFor="pub-prop-name" className="block text-xs font-medium mb-1">Property Name</label>
               <input
+                id="pub-prop-name"
                 type="text"
                 required
                 value={propForm.name}
-                onChange={(e) => setPropForm({ ...propForm, name: e.target.value })}
+                onChange={(e) => {
+                  setPropForm({ ...propForm, name: e.target.value });
+                  clearPropError('name');
+                }}
+                aria-invalid={Boolean(propErrors.name)}
+                aria-describedby={propErrors.name ? 'pub-prop-name-err' : undefined}
                 placeholder="Meridian Tech Journal"
-                className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
+                className={`w-full px-3 py-2 text-sm rounded-lg border ${fieldBorderClass(Boolean(propErrors.name))} bg-white dark:bg-slate-950`}
               />
+              <FieldError id="pub-prop-name-err" message={propErrors.name} />
             </div>
             <div>
-              <label className="block text-xs font-medium mb-1">Domain or App Bundle ID</label>
+              <label htmlFor="pub-prop-domain" className="block text-xs font-medium mb-1">
+                {propForm.propertyType === 'ios_app' || propForm.propertyType === 'android_app'
+                  ? 'App Bundle ID'
+                  : 'Domain'}
+              </label>
               <input
+                id="pub-prop-domain"
                 type="text"
                 required
                 value={propForm.domainOrBundle}
-                onChange={(e) => setPropForm({ ...propForm, domainOrBundle: e.target.value })}
-                placeholder="techjournal.meridian.io"
-                className="w-full px-3 py-2 text-sm font-mono rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
+                onChange={(e) => {
+                  setPropForm({ ...propForm, domainOrBundle: e.target.value });
+                  clearPropError('domainOrBundle');
+                }}
+                aria-invalid={Boolean(propErrors.domainOrBundle)}
+                aria-describedby={propErrors.domainOrBundle ? 'pub-prop-domain-err' : undefined}
+                placeholder={
+                  propForm.propertyType === 'ios_app' || propForm.propertyType === 'android_app'
+                    ? 'com.meridian.reader'
+                    : 'techjournal.meridian.io'
+                }
+                className={`w-full px-3 py-2 text-sm font-mono rounded-lg border ${fieldBorderClass(Boolean(propErrors.domainOrBundle))} bg-white dark:bg-slate-950`}
               />
+              <FieldError id="pub-prop-domain-err" message={propErrors.domainOrBundle} />
             </div>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <div>
-                <label className="block text-xs font-medium mb-1">Category</label>
+                <label htmlFor="pub-prop-cat" className="block text-xs font-medium mb-1">Category</label>
                 <select
+                  id="pub-prop-cat"
                   value={propForm.category}
-                  onChange={(e) => setPropForm({ ...propForm, category: e.target.value })}
-                  className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
+                  onChange={(e) => {
+                    setPropForm({ ...propForm, category: e.target.value });
+                    clearPropError('category');
+                  }}
+                  className={`w-full px-3 py-2 text-sm rounded-lg border ${fieldBorderClass(Boolean(propErrors.category))} bg-white dark:bg-slate-950`}
                 >
                   <option value="business_finance">Business & Finance</option>
                   <option value="news_technology">News & Tech</option>
                   <option value="fintech">Fintech</option>
                   <option value="retail">Retail & Commerce</option>
                 </select>
+                <FieldError id="pub-prop-cat-err" message={propErrors.category} />
               </div>
               <div>
-                <label className="block text-xs font-medium mb-1">Verification</label>
+                <label htmlFor="pub-prop-ver" className="block text-xs font-medium mb-1">Verification</label>
                 <select
+                  id="pub-prop-ver"
                   value={propForm.verificationMethod}
-                  onChange={(e) => setPropForm({ ...propForm, verificationMethod: e.target.value })}
-                  className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
+                  onChange={(e) => {
+                    setPropForm({ ...propForm, verificationMethod: e.target.value });
+                    clearPropError('verificationMethod');
+                  }}
+                  className={`w-full px-3 py-2 text-sm rounded-lg border ${fieldBorderClass(Boolean(propErrors.verificationMethod))} bg-white dark:bg-slate-950`}
                 >
                   <option value="dns_txt">DNS TXT</option>
                   <option value="ads_txt">ads.txt</option>
                   <option value="meta_tag">Meta Tag</option>
                 </select>
+                <FieldError id="pub-prop-ver-err" message={propErrors.verificationMethod} />
               </div>
             </div>
             <button
@@ -686,7 +830,7 @@ export const PublisherWorkspace: React.FC<PublisherWorkspaceProps> = ({ activeTa
                           onClick={() => handleVerifyProperty(p.id, true)}
                           className="px-3 py-1.5 text-xs font-medium border border-slate-300 dark:border-slate-700 rounded-lg hover:bg-slate-50 dark:hover:bg-slate-800"
                         >
-                          Verify (Sandbox)
+                          Verify Property
                         </button>
                       </div>
                     ) : (
@@ -708,41 +852,61 @@ export const PublisherWorkspace: React.FC<PublisherWorkspaceProps> = ({ activeTa
         <div className="grid lg:grid-cols-12 gap-6 items-start">
           <form
             onSubmit={handleAddPlacement}
+            noValidate
             className="lg:col-span-4 min-w-0 border border-slate-200 dark:border-slate-800 rounded-xl p-4 sm:p-5 bg-white dark:bg-slate-900 space-y-3.5"
           >
             <h2 className="text-base font-semibold">Create Ad Unit Placement</h2>
             <div>
-              <label className="block text-xs font-medium mb-1">Property</label>
+              <label htmlFor="plc-prop" className="block text-xs font-medium mb-1">Property</label>
               <select
+                id="plc-prop"
                 value={placeForm.propertyId}
-                onChange={(e) => setPlaceForm({ ...placeForm, propertyId: e.target.value })}
-                className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
+                onChange={(e) => {
+                  setPlaceForm({ ...placeForm, propertyId: e.target.value });
+                  clearPlaceError('propertyId');
+                }}
+                aria-invalid={Boolean(placeErrors.propertyId)}
+                aria-describedby={placeErrors.propertyId ? 'plc-prop-err' : undefined}
+                className={`w-full px-3 py-2 text-sm rounded-lg border ${fieldBorderClass(Boolean(placeErrors.propertyId))} bg-white dark:bg-slate-950`}
               >
+                {properties.length === 0 && <option value="">No registered properties</option>}
                 {properties.map((p) => (
                   <option key={p.id} value={p.id}>
                     {p.name} ({p.domain_or_bundle})
                   </option>
                 ))}
               </select>
+              <FieldError id="plc-prop-err" message={placeErrors.propertyId} />
             </div>
             <div>
-              <label className="block text-xs font-medium mb-1">Placement Name</label>
+              <label htmlFor="plc-name" className="block text-xs font-medium mb-1">Placement Name</label>
               <input
+                id="plc-name"
                 type="text"
                 required
                 value={placeForm.name}
-                onChange={(e) => setPlaceForm({ ...placeForm, name: e.target.value })}
+                onChange={(e) => {
+                  setPlaceForm({ ...placeForm, name: e.target.value });
+                  clearPlaceError('name');
+                }}
+                aria-invalid={Boolean(placeErrors.name)}
+                aria-describedby={placeErrors.name ? 'plc-name-err' : undefined}
                 placeholder="Sidebar Native Unit"
-                className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
+                className={`w-full px-3 py-2 text-sm rounded-lg border ${fieldBorderClass(Boolean(placeErrors.name))} bg-white dark:bg-slate-950`}
               />
+              <FieldError id="plc-name-err" message={placeErrors.name} />
             </div>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <div>
-                <label className="block text-xs font-medium mb-1">Format</label>
+                <label htmlFor="plc-format" className="block text-xs font-medium mb-1">Format</label>
                 <select
+                  id="plc-format"
                   value={placeForm.format}
-                  onChange={(e) => setPlaceForm({ ...placeForm, format: e.target.value })}
-                  className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
+                  onChange={(e) => {
+                    setPlaceForm({ ...placeForm, format: e.target.value });
+                    clearPlaceError('format');
+                  }}
+                  className={`w-full px-3 py-2 text-sm rounded-lg border ${fieldBorderClass(Boolean(placeErrors.format))} bg-white dark:bg-slate-950`}
                 >
                   <option value="native">Native</option>
                   <option value="banner">Display Banner</option>
@@ -751,27 +915,42 @@ export const PublisherWorkspace: React.FC<PublisherWorkspaceProps> = ({ activeTa
                   <option value="video">Video</option>
                   <option value="interstitial">Interstitial</option>
                 </select>
+                <FieldError id="plc-format-err" message={placeErrors.format} />
               </div>
               <div>
-                <label className="block text-xs font-medium mb-1">Dimensions</label>
+                <label htmlFor="plc-dims" className="block text-xs font-medium mb-1">Dimensions</label>
                 <input
+                  id="plc-dims"
                   type="text"
                   value={placeForm.dimensions}
-                  onChange={(e) => setPlaceForm({ ...placeForm, dimensions: e.target.value })}
-                  className="w-full px-3 py-2 text-sm font-mono rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
+                  onChange={(e) => {
+                    setPlaceForm({ ...placeForm, dimensions: e.target.value });
+                    clearPlaceError('dimensions');
+                  }}
+                  aria-invalid={Boolean(placeErrors.dimensions)}
+                  aria-describedby={placeErrors.dimensions ? 'plc-dims-err' : undefined}
+                  className={`w-full px-3 py-2 text-sm font-mono rounded-lg border ${fieldBorderClass(Boolean(placeErrors.dimensions))} bg-white dark:bg-slate-950`}
                 />
+                <FieldError id="plc-dims-err" message={placeErrors.dimensions} />
               </div>
             </div>
             <div>
-              <label className="block text-xs font-medium mb-1">Floor CPM (USD)</label>
+              <label htmlFor="plc-floor" className="block text-xs font-medium mb-1">Floor CPM (USD)</label>
               <input
+                id="plc-floor"
                 type="number"
                 step="0.1"
                 min="0.1"
                 value={placeForm.floorCpmUsd}
-                onChange={(e) => setPlaceForm({ ...placeForm, floorCpmUsd: Number(e.target.value) })}
-                className="w-full px-3 py-2 text-sm font-mono rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
+                onChange={(e) => {
+                  setPlaceForm({ ...placeForm, floorCpmUsd: Number(e.target.value) });
+                  clearPlaceError('floorCpmUsd');
+                }}
+                aria-invalid={Boolean(placeErrors.floorCpmUsd)}
+                aria-describedby={placeErrors.floorCpmUsd ? 'plc-floor-err' : undefined}
+                className={`w-full px-3 py-2 text-sm font-mono rounded-lg border ${fieldBorderClass(Boolean(placeErrors.floorCpmUsd))} bg-white dark:bg-slate-950`}
               />
+              <FieldError id="plc-floor-err" message={placeErrors.floorCpmUsd} />
             </div>
             <button
               type="submit"
@@ -1175,6 +1354,7 @@ let ad = try await client.requestAd(
         <div className="grid lg:grid-cols-12 gap-6 items-start">
           <form
             onSubmit={handleRequestWithdrawal}
+            noValidate
             className="lg:col-span-4 min-w-0 border border-slate-200 dark:border-slate-800 rounded-xl p-4 sm:p-5 bg-white dark:bg-slate-900 space-y-3.5"
           >
             <h2 className="text-base font-semibold">Request Payout Withdrawal</h2>
@@ -1183,15 +1363,22 @@ let ad = try await client.requestAd(
               Finalized available: <span className="font-mono">{formatMicros(earnings.wallet.available_micros)}</span>.
             </p>
             <div>
-              <label className="block text-xs font-medium mb-1">Withdrawal Amount (USD)</label>
+              <label htmlFor="pub-withdraw-amt" className="block text-xs font-medium mb-1">Withdrawal Amount (USD)</label>
               <input
+                id="pub-withdraw-amt"
                 type="number"
                 min="1"
                 required
                 value={withdrawUsd}
-                onChange={(e) => setWithdrawUsd(e.target.value)}
-                className="w-full px-3 py-2 text-sm font-mono rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
+                onChange={(e) => {
+                  setWithdrawUsd(e.target.value);
+                  setWithdrawErrors({});
+                }}
+                aria-invalid={Boolean(withdrawErrors.amountUsd)}
+                aria-describedby={withdrawErrors.amountUsd ? 'pub-withdraw-amt-err' : undefined}
+                className={`w-full px-3 py-2 text-sm font-mono rounded-lg border ${fieldBorderClass(Boolean(withdrawErrors.amountUsd))} bg-white dark:bg-slate-950`}
               />
+              <FieldError id="pub-withdraw-amt-err" message={withdrawErrors.amountUsd} />
             </div>
             <button
               type="submit"
@@ -1240,6 +1427,7 @@ let ad = try await client.requestAd(
         <div className="grid lg:grid-cols-12 gap-6 items-start">
           <form
             onSubmit={handleSavePayoutMethod}
+            noValidate
             className="lg:col-span-5 min-w-0 border border-slate-200 dark:border-slate-800 rounded-xl p-4 sm:p-5 bg-white dark:bg-slate-900 space-y-3.5"
           >
             <h2 className="text-base font-semibold">Payout Method & Thresholds</h2>
@@ -1247,26 +1435,40 @@ let ad = try await client.requestAd(
               Minimum payout threshold is <span className="font-mono">{formatMicros(earnings.minPayoutMicros)}</span>. Invalid traffic deductions ({formatMicros(earnings.wallet.invalid_deducted_micros)} lifetime) are excluded prior to payout eligibility.
             </p>
             <div>
-              <label className="block text-xs font-medium mb-1">Settlement Method</label>
+              <label htmlFor="pub-payout-method" className="block text-xs font-medium mb-1">Settlement Method</label>
               <select
+                id="pub-payout-method"
                 value={payoutMethodType}
-                onChange={(e) => setPayoutMethodType(e.target.value)}
-                className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
+                onChange={(e) => {
+                  setPayoutMethodType(e.target.value);
+                  clearPayoutError('payoutMethodType');
+                }}
+                aria-invalid={Boolean(payoutErrors.payoutMethodType)}
+                aria-describedby={payoutErrors.payoutMethodType ? 'pub-payout-method-err' : undefined}
+                className={`w-full px-3 py-2 text-sm rounded-lg border ${fieldBorderClass(Boolean(payoutErrors.payoutMethodType))} bg-white dark:bg-slate-950`}
               >
                 <option value="bank_transfer">International Bank Transfer</option>
                 <option value="paystack">Paystack Settlement</option>
                 <option value="flutterwave">Flutterwave Payout</option>
               </select>
+              <FieldError id="pub-payout-method-err" message={payoutErrors.payoutMethodType} />
             </div>
             <div>
-              <label className="block text-xs font-medium mb-1">Destination Account / IBAN</label>
+              <label htmlFor="pub-payout-dest" className="block text-xs font-medium mb-1">Destination Account / IBAN</label>
               <input
+                id="pub-payout-dest"
                 type="text"
                 value={payoutDestination}
-                onChange={(e) => setPayoutDestination(e.target.value)}
+                onChange={(e) => {
+                  setPayoutDestination(e.target.value);
+                  clearPayoutError('payoutDestination');
+                }}
+                aria-invalid={Boolean(payoutErrors.payoutDestination)}
+                aria-describedby={payoutErrors.payoutDestination ? 'pub-payout-dest-err' : undefined}
                 placeholder="IBAN / Settlement Account Reference"
-                className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
+                className={`w-full px-3 py-2 text-sm rounded-lg border ${fieldBorderClass(Boolean(payoutErrors.payoutDestination))} bg-white dark:bg-slate-950`}
               />
+              <FieldError id="pub-payout-dest-err" message={payoutErrors.payoutDestination} />
             </div>
             <button
               type="submit"

@@ -298,8 +298,8 @@ test('HTTP E2E: Security Hardening — Auth, Demo Bypass Blocked, One-Time Admin
     assert.ok(envAdminLogin.data.token);
     delete process.env.ADMIN_PASSCODE;
 
-    // External publisher self-registration blocked at launch
-    const pubBlock = await reqJson('/api/auth/register', {
+    // Publisher self-registration works cleanly, provisions publisher account + wallet, and enforces RBAC
+    const pubReg = await reqJson('/api/auth/register', {
       method: 'POST',
       body: {
         email: 'extpub@example.com',
@@ -307,9 +307,32 @@ test('HTTP E2E: Security Hardening — Auth, Demo Bypass Blocked, One-Time Admin
         password: 'Password123!',
         role: 'publisher',
         organizationName: 'External News',
+        country: 'GB',
+      },
+    });
+    assert.equal(pubReg.status, 201);
+    assert.ok(pubReg.data.token);
+    assert.equal(pubReg.data.user.role, 'publisher');
+    const pubSelfOv = await reqJson('/api/publisher/overview', { token: pubReg.data.token as string });
+    assert.equal(pubSelfOv.status, 200);
+    assert.equal(pubSelfOv.data.account.organization_name, 'External News');
+    assert.equal((await reqJson('/api/advertiser/overview', { token: pubReg.data.token as string })).status, 403);
+    assert.equal((await reqJson('/api/admin/overview', { token: pubReg.data.token as string })).status, 403);
+
+    // Feature flag kill switch still blocks publisher registration if disabled by admin
+    db.prepare("UPDATE platform_settings SET value_json = 'false' WHERE key = 'external_publisher_registration_enabled'").run();
+    const pubBlock = await reqJson('/api/auth/register', {
+      method: 'POST',
+      body: {
+        email: 'blockedpub@example.com',
+        fullName: 'Blocked Pub',
+        password: 'Password123!',
+        role: 'publisher',
+        organizationName: 'Blocked News',
       },
     });
     assert.equal(pubBlock.status, 403);
+    db.prepare("UPDATE platform_settings SET value_json = 'true' WHERE key = 'external_publisher_registration_enabled'").run();
 
     // Register advertiser
     const reg = await reqJson('/api/auth/register', {
@@ -1202,3 +1225,105 @@ test('HTTP E2E: Publisher CRUD, Admin Operations, Appeals, Withdrawals, Hardened
     await close();
   }
 });
+
+test('HTTP E2E: Editing existing campaigns updates format, dimensions, objective, pricing model, and enforces policy scan', async () => {
+  const { reqJson, authenticateTestActors, close } = await startTestServer();
+  try {
+    const { advToken } = await authenticateTestActors();
+
+    // Create a banner campaign with explicit IAB dimensions
+    const created = await reqJson('/api/advertiser/campaigns', {
+      method: 'POST',
+      token: advToken,
+      body: {
+        name: 'Banner Launch Campaign',
+        objective: 'brand_awareness',
+        pricingModel: 'CPM',
+        dailyBudgetUsd: 75,
+        totalBudgetUsd: 750,
+        maxBidUsd: 4.5,
+        format: 'banner',
+        dimensions: '728x90',
+        title: 'Scale Treasury Workflows',
+        description: 'Automated corporate cards with real-time budgets.',
+        mediaUrl: '/src/assets/images/creative_fintech_card_1795552815861.jpg',
+        destinationUrl: 'https://atlascommerce.io/banner',
+        ctaText: 'Shop Now',
+        trackingParams: 'utm_source=looma&utm_medium=banner',
+      },
+    });
+    assert.equal(created.status, 201);
+    const campaignId = created.data.campaignId as string;
+
+    const fetched1 = await reqJson(`/api/advertiser/campaigns/${campaignId}`, { token: advToken });
+    assert.equal(fetched1.status, 200);
+    assert.equal(fetched1.data.campaign.ad_format, 'banner');
+    assert.equal(fetched1.data.campaign.dimensions, '728x90');
+
+    // Edit existing campaign: switch to Text Ad and update objective, pricing model, copy, and tracking
+    const editedToText = await reqJson(`/api/advertiser/campaigns/${campaignId}`, {
+      method: 'PATCH',
+      token: advToken,
+      body: {
+        name: 'Text Search Relaunch',
+        objective: 'lead_generation',
+        pricingModel: 'CPC',
+        format: 'text',
+        dimensions: 'text',
+        title: 'Cut Cloud Compute Spend 35%',
+        description: 'Right-size clusters automatically with zero agent overhead.',
+        destinationUrl: 'https://atlascommerce.io/text-offer',
+        ctaText: 'Visit Site',
+        trackingParams: 'utm_source=looma&utm_medium=text',
+        dailyBudgetUsd: 120,
+        totalBudgetUsd: 1200,
+      },
+    });
+    assert.equal(editedToText.status, 200);
+    assert.equal(editedToText.data.updated, true);
+
+    const fetched2 = await reqJson(`/api/advertiser/campaigns/${campaignId}`, { token: advToken });
+    assert.equal(fetched2.status, 200);
+    assert.equal(fetched2.data.campaign.name, 'Text Search Relaunch');
+    assert.equal(fetched2.data.campaign.objective, 'lead_generation');
+    assert.equal(fetched2.data.campaign.pricing_model, 'CPC');
+    assert.equal(fetched2.data.campaign.ad_format, 'text');
+    assert.equal(fetched2.data.campaign.dimensions, 'text');
+    assert.equal(fetched2.data.campaign.media_url, '');
+    assert.equal(fetched2.data.campaign.creative_title, 'Cut Cloud Compute Spend 35%');
+    assert.equal(fetched2.data.campaign.cta_text, 'Visit Site');
+
+    // Edit again: switch to Video Ad 9:16 with CPV billing
+    const editedToVideo = await reqJson(`/api/advertiser/campaigns/${campaignId}`, {
+      method: 'PATCH',
+      token: advToken,
+      body: {
+        objective: 'video_views',
+        pricingModel: 'CPV',
+        format: 'video',
+        dimensions: '9:16',
+        mediaUrl: 'https://cdn.atlascommerce.io/spot-vertical.mp4',
+      },
+    });
+    assert.equal(editedToVideo.status, 200);
+
+    const fetched3 = await reqJson(`/api/advertiser/campaigns/${campaignId}`, { token: advToken });
+    assert.equal(fetched3.data.campaign.ad_format, 'video');
+    assert.equal(fetched3.data.campaign.dimensions, '9:16');
+    assert.equal(fetched3.data.campaign.pricing_model, 'CPV');
+    assert.equal(fetched3.data.campaign.media_url, 'https://cdn.atlascommerce.io/spot-vertical.mp4');
+
+    // Prohibited content scan must block unsafe edits with 422
+    const blockedEdit = await reqJson(`/api/advertiser/campaigns/${campaignId}`, {
+      method: 'PATCH',
+      token: advToken,
+      body: {
+        title: 'Buy Counterfeit Malware Toolkit',
+      },
+    });
+    assert.equal(blockedEdit.status, 422);
+  } finally {
+    await close();
+  }
+});
+

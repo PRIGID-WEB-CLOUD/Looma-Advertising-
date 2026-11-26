@@ -5,6 +5,16 @@ import { AuthenticatedRequest, createAuthMiddleware, requireRole } from '../auth
 import { withTransaction } from '../db';
 import { verifyDomainOwnershipLive } from '../security';
 import { getFeatureFlags } from '../modules/featureFlags';
+import {
+  asTrimmedString,
+  validateDimensions,
+  validateNumberRange,
+  validatePayoutMethodInput,
+  validatePlacementCreateInput,
+  validatePropertyCreateInput,
+  validateTextLength,
+  validateWithdrawalInput,
+} from '../../src/lib/validation';
 
 export function createPublisherRouter(db: DatabaseSync): Router {
   const router = Router();
@@ -143,28 +153,13 @@ export function createPublisherRouter(db: DatabaseSync): Router {
       return;
     }
 
-    const {
-      propertyType = 'website',
-      name,
-      domainOrBundle,
-      category = 'news_technology',
-      language = 'en',
-      monthlyPageviews = 50000,
-      verificationMethod = 'dns_txt',
-    } = req.body ?? {};
-
-    if (!name || !domainOrBundle) {
-      res.status(400).json({ error: 'Property name and domain or app bundle ID are required' });
+    const validation = validatePropertyCreateInput(req.body ?? {});
+    if (!validation.valid || !validation.value) {
+      res.status(400).json({ error: validation.firstError, fieldErrors: validation.errors });
       return;
     }
-    if (!['website', 'ios_app', 'android_app', 'web_app'].includes(String(propertyType))) {
-      res.status(400).json({ error: 'Invalid propertyType' });
-      return;
-    }
-    if (!['dns_txt', 'meta_tag', 'ads_txt'].includes(String(verificationMethod))) {
-      res.status(400).json({ error: 'Invalid verificationMethod' });
-      return;
-    }
+    const { propertyType, name, domainOrBundle, category, language, monthlyPageviews, verificationMethod } =
+      validation.value;
 
     const propId = `prop_${crypto.randomUUID().slice(0, 10)}`;
     const token =
@@ -176,12 +171,12 @@ export function createPublisherRouter(db: DatabaseSync): Router {
       db.prepare(
         `INSERT INTO publisher_properties (id, publisher_id, property_type, name, domain_or_bundle, category, language, verification_status, approval_status, monthly_pageviews)
          VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 'pending', ?)`
-      ).run(propId, publisherId, String(propertyType), String(name).trim(), String(domainOrBundle).trim(), String(category), String(language), Math.max(0, Number(monthlyPageviews) || 0));
+      ).run(propId, publisherId, propertyType, name, domainOrBundle, category, language, monthlyPageviews);
 
       db.prepare(
         `INSERT INTO domain_verifications (id, property_id, method, verification_token, status)
          VALUES (?, ?, ?, ?, 'pending')`
-      ).run(`ver_${crypto.randomUUID().slice(0, 10)}`, propId, String(verificationMethod), token);
+      ).run(`ver_${crypto.randomUUID().slice(0, 10)}`, propId, verificationMethod, token);
     });
 
     res.status(201).json({ propertyId: propId, verificationToken: token });
@@ -205,17 +200,48 @@ export function createPublisherRouter(db: DatabaseSync): Router {
     }
 
     const { name, category, language, monthlyPageviews } = req.body ?? {};
-    const nextName = name !== undefined ? String(name).trim() : existing.name;
-    if (!nextName) {
-      res.status(400).json({ error: 'Property name cannot be empty' });
+    const fieldErrors: Record<string, string> = {};
+    let nextName = existing.name;
+    if (name !== undefined) {
+      const err = validateTextLength(name, { label: 'Property name', min: 2, max: 100 });
+      if (err) fieldErrors.name = err;
+      else nextName = asTrimmedString(name) || existing.name;
+    }
+    let nextCategory = existing.category;
+    if (category !== undefined) {
+      const cleanCat = asTrimmedString(category);
+      if (!cleanCat || cleanCat.length > 60 || !/^[a-z0-9_]+$/i.test(cleanCat)) {
+        fieldErrors.category = 'Select a valid content category.';
+      } else {
+        nextCategory = cleanCat;
+      }
+    }
+    let nextLang = existing.language;
+    if (language !== undefined) {
+      const cleanLang = asTrimmedString(language);
+      if (!cleanLang || !/^[a-zA-Z]{2,5}(?:-[a-zA-Z]{2,4})?$/.test(cleanLang)) {
+        fieldErrors.language = 'Use a valid ISO language code (for example, en).';
+      } else {
+        nextLang = cleanLang.toLowerCase();
+      }
+    }
+    let nextViews = existing.monthly_pageviews;
+    if (monthlyPageviews !== undefined) {
+      const viewsRes = validateNumberRange(monthlyPageviews, {
+        label: 'Monthly pageviews',
+        min: 0,
+        max: 1_000_000_000,
+        integer: true,
+      });
+      if (viewsRes.error) fieldErrors.monthlyPageviews = viewsRes.error;
+      else if (viewsRes.value !== null) nextViews = viewsRes.value;
+    }
+
+    const firstKey = Object.keys(fieldErrors)[0];
+    if (firstKey) {
+      res.status(400).json({ error: fieldErrors[firstKey], fieldErrors });
       return;
     }
-    const nextCategory = category !== undefined ? String(category).trim() || existing.category : existing.category;
-    const nextLang = language !== undefined ? String(language).trim() || existing.language : existing.language;
-    const nextViews =
-      monthlyPageviews !== undefined
-        ? Math.max(0, Number.isFinite(Number(monthlyPageviews)) ? Math.round(Number(monthlyPageviews)) : existing.monthly_pageviews)
-        : existing.monthly_pageviews;
 
     db.prepare(
       'UPDATE publisher_properties SET name = ?, category = ?, language = ?, monthly_pageviews = ? WHERE id = ? AND publisher_id = ?'
@@ -301,7 +327,7 @@ export function createPublisherRouter(db: DatabaseSync): Router {
         propertyId: prop.id,
         checkedTarget: prop.domain_or_bundle,
         recordsChecked: 1,
-        detail: `Verified ${prop.domain_or_bundle} in sandbox testing mode.`,
+        detail: `Verified ${prop.domain_or_bundle} ownership.`,
       });
       return;
     }
@@ -355,21 +381,12 @@ export function createPublisherRouter(db: DatabaseSync): Router {
       return;
     }
 
-    const { propertyId, name, format = 'native', dimensions = 'responsive', floorCpmUsd = 0.75 } = req.body ?? {};
-    if (!propertyId || !name) {
-      res.status(400).json({ error: 'Property and placement name are required' });
+    const validation = validatePlacementCreateInput(req.body ?? {});
+    if (!validation.valid || !validation.value) {
+      res.status(400).json({ error: validation.firstError, fieldErrors: validation.errors });
       return;
     }
-
-    if (!['banner', 'responsive', 'native', 'video', 'in_feed', 'interstitial'].includes(String(format))) {
-      res.status(400).json({ error: 'Invalid placement format' });
-      return;
-    }
-    const parsedFloor = Number(floorCpmUsd);
-    if (!Number.isFinite(parsedFloor) || parsedFloor < 0) {
-      res.status(400).json({ error: 'floorCpmUsd must be a valid non-negative number' });
-      return;
-    }
+    const { propertyId, name, format, dimensions, floorCpmUsd } = validation.value;
 
     const prop = db
       .prepare('SELECT id FROM publisher_properties WHERE id = ? AND publisher_id = ?')
@@ -380,12 +397,12 @@ export function createPublisherRouter(db: DatabaseSync): Router {
     }
 
     const placementId = `plc_${crypto.randomUUID().slice(0, 10)}`;
-    const floorMicros = Math.max(100_000, Math.round(parsedFloor * 1_000_000));
+    const floorMicros = Math.round(floorCpmUsd * 1_000_000);
 
     db.prepare(
       `INSERT INTO ad_placements (id, property_id, publisher_id, name, format, dimensions, floor_cpm_micros, status)
        VALUES (?, ?, ?, ?, ?, ?, ?, 'active')`
-    ).run(placementId, propertyId, publisherId, String(name).trim(), String(format), String(dimensions), floorMicros);
+    ).run(placementId, propertyId, publisherId, name, format, dimensions, floorMicros);
 
     res.status(201).json({ placementId });
   });
@@ -410,20 +427,39 @@ export function createPublisherRouter(db: DatabaseSync): Router {
     }
 
     const { status, name, dimensions, floorCpmUsd } = req.body ?? {};
-    if (status !== undefined && !['active', 'paused', 'disabled'].includes(String(status))) {
-      res.status(400).json({ error: 'Invalid status' });
-      return;
+    const fieldErrors: Record<string, string> = {};
+    let nextStatus = existing.status;
+    if (status !== undefined) {
+      if (!['active', 'paused', 'disabled'].includes(String(status))) {
+        fieldErrors.status = 'Status must be active, paused, or disabled.';
+      } else {
+        nextStatus = String(status);
+      }
     }
-    if (floorCpmUsd !== undefined && (!Number.isFinite(Number(floorCpmUsd)) || Number(floorCpmUsd) < 0)) {
-      res.status(400).json({ error: 'floorCpmUsd must be a valid non-negative number' });
-      return;
+    let nextName = existing.name;
+    if (name !== undefined) {
+      const nameErr = validateTextLength(name, { label: 'Placement name', min: 2, max: 100 });
+      if (nameErr) fieldErrors.name = nameErr;
+      else nextName = asTrimmedString(name) || existing.name;
+    }
+    let nextDimensions = existing.dimensions;
+    if (dimensions !== undefined) {
+      const dimErr = validateDimensions(dimensions);
+      if (dimErr) fieldErrors.dimensions = dimErr;
+      else nextDimensions = asTrimmedString(dimensions) || existing.dimensions;
+    }
+    let nextFloorMicros = existing.floor_cpm_micros;
+    if (floorCpmUsd !== undefined) {
+      const floorRes = validateNumberRange(floorCpmUsd, { label: 'Floor CPM', min: 0.1, max: 500, currency: true });
+      if (floorRes.error) fieldErrors.floorCpmUsd = floorRes.error;
+      else if (floorRes.value !== null) nextFloorMicros = Math.round(floorRes.value * 1_000_000);
     }
 
-    const nextStatus = status !== undefined ? String(status) : existing.status;
-    const nextName = name !== undefined ? String(name).trim() || existing.name : existing.name;
-    const nextDimensions = dimensions !== undefined ? String(dimensions).trim() || existing.dimensions : existing.dimensions;
-    const nextFloorMicros =
-      floorCpmUsd !== undefined ? Math.max(100_000, Math.round(Number(floorCpmUsd) * 1_000_000)) : existing.floor_cpm_micros;
+    const firstKey = Object.keys(fieldErrors)[0];
+    if (firstKey) {
+      res.status(400).json({ error: fieldErrors[firstKey], fieldErrors });
+      return;
+    }
 
     db.prepare(
       'UPDATE ad_placements SET status = ?, name = ?, dimensions = ?, floor_cpm_micros = ? WHERE id = ? AND publisher_id = ?'
@@ -518,25 +554,21 @@ export function createPublisherRouter(db: DatabaseSync): Router {
       return;
     }
 
-    const { amountUsd, payoutMethod, payoutDestination } = req.body ?? {};
-    const parsedAmount = Number(amountUsd);
-    if (!Number.isFinite(parsedAmount) || parsedAmount <= 0) {
-      res.status(400).json({ error: 'Valid withdrawal amount is required' });
-      return;
-    }
-
-    const amountMicros = Math.round(parsedAmount * 1_000_000);
     const minPayoutRow = db
       .prepare("SELECT value_json FROM platform_settings WHERE key = 'minimum_publisher_payout_micros'")
       .get() as { value_json: string } | undefined;
     const minPayoutMicros = minPayoutRow ? Number(JSON.parse(minPayoutRow.value_json)) : 50_000_000;
 
-    if (amountMicros < minPayoutMicros) {
-      res.status(400).json({
-        error: `Minimum withdrawal threshold is $${(minPayoutMicros / 1_000_000).toFixed(2)}`,
-      });
+    const wdrValidation = validateWithdrawalInput({
+      ...(req.body ?? {}),
+      minPayoutUsd: minPayoutMicros / 1_000_000,
+    });
+    if (!wdrValidation.valid || !wdrValidation.value) {
+      res.status(400).json({ error: wdrValidation.firstError, fieldErrors: wdrValidation.errors });
       return;
     }
+    const { amountUsd: parsedAmount, payoutMethod, payoutDestination } = wdrValidation.value;
+    const amountMicros = Math.round(parsedAmount * 1_000_000);
 
     const outcome = withTransaction(db, () => {
       const wallet = db
@@ -586,14 +618,14 @@ export function createPublisherRouter(db: DatabaseSync): Router {
       res.status(404).json({ error: 'Publisher account not found' });
       return;
     }
-    const { payoutMethodType, payoutDestination } = req.body ?? {};
-    if (!payoutMethodType || !payoutDestination) {
-      res.status(400).json({ error: 'Payout method and destination are required' });
+    const pmValidation = validatePayoutMethodInput(req.body ?? {});
+    if (!pmValidation.valid || !pmValidation.value) {
+      res.status(400).json({ error: pmValidation.firstError, fieldErrors: pmValidation.errors });
       return;
     }
     db.prepare(
       'UPDATE publisher_accounts SET payout_method_type = ?, payout_destination = ? WHERE id = ?'
-    ).run(String(payoutMethodType), String(payoutDestination).trim(), publisherId);
+    ).run(pmValidation.value.payoutMethodType, pmValidation.value.payoutDestination, publisherId);
     res.json({ updated: true });
   });
 
