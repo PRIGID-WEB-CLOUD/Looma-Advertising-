@@ -28,8 +28,8 @@ async function startServer() {
   const port = Number(process.env.PORT || 3000);
   const isProd = process.env.NODE_ENV === 'production';
 
-  const db = getDb();
-  seedDatabaseIfEmpty(db);
+  const db = await getDb();
+  await seedDatabaseIfEmpty(db);
   startBackgroundScheduler(db);
 
   app.set('trust proxy', 1);
@@ -78,8 +78,8 @@ async function startServer() {
 
   // Public ad-serving endpoints (enforces first-party vs third-party feature flags per placement)
   app.use('/api/v1/ad', cors({ origin: '*' }), createAdDeliveryRouter(db));
-  app.get('/sdk/looma-ads.js', cors({ origin: '*' }), (_req, res) => {
-    const flags = getFeatureFlags(db);
+  app.get('/sdk/looma-ads.js', cors({ origin: '*' }), async (_req, res) => {
+    const flags = await getFeatureFlags(db);
     res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
     res.setHeader(
       'X-Looma-SDK-Mode',
@@ -149,7 +149,17 @@ async function startServer() {
         return;
       }
       const status = typeof errObj?.status === 'number' && errObj.status >= 400 && errObj.status < 600 ? errObj.status : 500;
-      const message = err instanceof Error ? err.message : 'Internal server error';
+      if (status >= 500) {
+        console.error(`[server] Unhandled error on ${req.path}:`, err);
+      }
+      const message =
+        status >= 500
+          ? status === 503
+            ? 'Service temporarily unavailable'
+            : 'Internal server error'
+          : err instanceof Error
+            ? err.message
+            : 'Request failed';
       res.status(status).json({ error: message });
       return;
     }
@@ -157,6 +167,28 @@ async function startServer() {
   });
 
   if (!isProd) {
+    const viteAdmin = await createViteServer({
+      root: path.resolve(process.cwd(), 'admin'),
+      configFile: path.resolve(process.cwd(), 'admin/vite.config.ts'),
+      base: '/admin/',
+      server: {
+        middlewareMode: true,
+        hmr: false,
+      },
+      appType: 'spa',
+    });
+    app.use((req, res, next) => {
+      if (req.path === '/admin') {
+        res.redirect(302, '/admin/');
+        return;
+      }
+      if (req.path.startsWith('/admin/')) {
+        viteAdmin.middlewares(req, res, next);
+        return;
+      }
+      next();
+    });
+
     const vite = await createViteServer({
       server: {
         middlewareMode: true,
@@ -166,6 +198,24 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
+    const adminDistDir = path.resolve(process.cwd(), 'admin/dist');
+    app.use((req, res, next) => {
+      if (req.path === '/admin') {
+        res.redirect(302, '/admin/');
+        return;
+      }
+      next();
+    });
+    app.use('/admin', express.static(adminDistDir));
+    app.use('/admin', (_req, res) => {
+      const adminIndex = path.join(adminDistDir, 'index.html');
+      if (fs.existsSync(adminIndex)) {
+        res.sendFile(adminIndex);
+      } else {
+        res.status(404).send('Admin build output not found. Run npm run build.');
+      }
+    });
+
     const distDir = path.resolve(process.cwd(), 'dist');
     app.use(express.static(distDir));
     app.use('/src/assets', express.static(path.resolve(process.cwd(), 'src/assets')));

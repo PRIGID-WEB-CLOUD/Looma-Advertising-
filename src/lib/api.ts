@@ -7,13 +7,42 @@ export interface AuthUser {
   role: UserRole;
 }
 
-let inMemoryToken: string | null = null;
+const TOKEN_STORAGE_KEY = 'looma_ads_auth_token';
+
+function readStoredToken(): string | null {
+  try {
+    if (typeof window === 'undefined' || !window.localStorage) return null;
+    return window.localStorage.getItem(TOKEN_STORAGE_KEY);
+  } catch {
+    return null;
+  }
+}
+
+let inMemoryToken: string | null = readStoredToken();
+let unauthorizedHandler: (() => void) | null = null;
+
+export function setUnauthorizedHandler(handler: (() => void) | null) {
+  unauthorizedHandler = handler;
+}
 
 export function setAuthToken(token: string | null) {
   inMemoryToken = token;
+  try {
+    if (typeof window === 'undefined' || !window.localStorage) return;
+    if (token) {
+      window.localStorage.setItem(TOKEN_STORAGE_KEY, token);
+    } else {
+      window.localStorage.removeItem(TOKEN_STORAGE_KEY);
+    }
+  } catch {
+    // Ignore storage access errors in restricted contexts
+  }
 }
 
 export function getAuthToken(): string | null {
+  if (!inMemoryToken) {
+    inMemoryToken = readStoredToken();
+  }
   return inMemoryToken;
 }
 
@@ -63,6 +92,16 @@ export async function apiRequest<T>(path: string, options: RequestInit = {}): Pr
   };
 
   if (!response.ok) {
+    if (
+      response.status === 401 &&
+      inMemoryToken &&
+      !path.startsWith('/api/auth/login') &&
+      !path.startsWith('/api/auth/register') &&
+      !path.startsWith('/api/auth/reset-password')
+    ) {
+      setAuthToken(null);
+      unauthorizedHandler?.();
+    }
     let errorMessage = `Request failed (${response.status})`;
     let fieldErrors: Record<string, string> | undefined;
     const errData = tryParseJson();

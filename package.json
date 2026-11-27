@@ -5,21 +5,30 @@
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
-    "build": "vite build",
+    "build": "vite build && npm --prefix admin run build",
+    "build:cf": "vite build && ADMIN_BASE=/ npm --prefix admin run build && node -e \"const fs=require('fs');fs.rmSync('dist-admin',{recursive:true,force:true});fs.cpSync('admin/dist','dist-admin',{recursive:true});fs.cpSync('src/assets','dist/src/assets',{recursive:true});fs.cpSync('src/assets','dist-admin/src/assets',{recursive:true});\"",
+    "deploy:cf": "npm run build:cf && wrangler deploy && wrangler deploy --config wrangler.admin.jsonc",
+    "cf-typegen": "wrangler types",
     "start": "NODE_ENV=production tsx server.ts",
-    "lint": "tsc --noEmit",
-    "test": "tsx --test server/engine.test.ts server/integration.test.ts server/modules/modules.test.ts server/httpCrud.test.ts server/validation.http.test.ts src/lib/footerRoutes.test.ts src/lib/adFormats.test.ts src/lib/validation.test.ts"
+    "lint": "tsc --noEmit && tsc -p worker/tsconfig.json --noEmit",
+    "test": "tsx --test server/engine.test.ts server/db.test.ts server/integration.test.ts server/modules/modules.test.ts server/httpCrud.test.ts server/validation.http.test.ts server/securityAudit.test.ts worker/worker.test.ts src/lib/footerRoutes.test.ts src/lib/adFormats.test.ts src/lib/validation.test.ts src/lib/pricingModels.test.ts"
   },
   "dependencies": {
+    "@cloudflare/workers-types": "^5.20261125.1",
     "@tailwindcss/vite": "^4.3.5",
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
+    "@types/pg": "^8.23.1",
     "@types/react": "^19.3.1",
     "@types/react-dom": "^19.3.0",
     "@vitejs/plugin-react": "^6.3.0",
     "cors": "^2.8.6",
+    "drizzle-kit": "^0.31.11",
+    "drizzle-orm": "^0.45.4",
     "express": "^5.3.0",
+    "hono": "^4.13.23",
     "lucide-react": "^1.79.0",
+    "pg": "^8.23.1",
     "react": "^19.3.1",
     "react-dom": "^19.3.1",
     "recharts": "^3.11.1",
@@ -28,5 +37,7 @@
     "typescript": "^7.0.2",
     "vite": "^8.3.8"
   },
-  "devDependencies": {}
+  "devDependencies": {
+    "wrangler": "^4.168.0"
+  }
 }

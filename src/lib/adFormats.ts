@@ -345,3 +345,197 @@ export function validateCreativeForFormat(input: {
   }
   return null;
 }
+
+export type PlacementFormat =
+  | 'native'
+  | 'banner'
+  | 'responsive'
+  | 'in_feed'
+  | 'video'
+  | 'interstitial';
+
+export interface PlacementFormatSpec {
+  format: PlacementFormat;
+  label: string;
+  summary: string;
+  defaultDimensions: string;
+  dimensionsOptions: DimensionOption[];
+  compatibleCreativeFormats: AdFormat[];
+  defaultCreativeFormat: AdFormat;
+}
+
+export const PLACEMENT_FORMAT_SPECS: Record<PlacementFormat, PlacementFormatSpec> = {
+  native: {
+    format: 'native',
+    label: 'Native',
+    summary: 'Matches host editorial feed styling and accepts native, sponsored, responsive, image, and text units.',
+    defaultDimensions: 'responsive',
+    dimensionsOptions: [
+      { value: 'responsive', label: 'Fluid Native Card (Responsive)' },
+      { value: '1200x628', label: '1200×628 Editorial Card' },
+    ],
+    compatibleCreativeFormats: ['native', 'sponsored', 'responsive', 'image', 'text'],
+    defaultCreativeFormat: 'native',
+  },
+  banner: {
+    format: 'banner',
+    label: 'Display Banner',
+    summary: 'Standard IAB display slot for header leaderboards, sidebars, and mobile banners.',
+    defaultDimensions: '728x90',
+    dimensionsOptions: [
+      { value: '728x90', label: '728×90 Leaderboard' },
+      { value: '300x250', label: '300×250 Medium Rectangle' },
+      { value: '320x50', label: '320×50 Mobile Banner' },
+      { value: '160x600', label: '160×600 Wide Skyscraper' },
+    ],
+    compatibleCreativeFormats: ['banner', 'image', 'responsive'],
+    defaultCreativeFormat: 'banner',
+  },
+  responsive: {
+    format: 'responsive',
+    label: 'Responsive',
+    summary: 'Fluid adaptive slot eligible for every creative format across desktop and mobile viewports.',
+    defaultDimensions: 'responsive',
+    dimensionsOptions: [
+      { value: 'responsive', label: 'Adaptive Multi-Viewport' },
+      { value: '1200x628', label: '1200×628 Landscape' },
+    ],
+    compatibleCreativeFormats: ['responsive', 'native', 'banner', 'image', 'text', 'video', 'sponsored'],
+    defaultCreativeFormat: 'responsive',
+  },
+  in_feed: {
+    format: 'in_feed',
+    label: 'In-Feed',
+    summary: 'Social and content stream placement blending native cards, full-bleed images, video, and brand stories.',
+    defaultDimensions: 'responsive',
+    dimensionsOptions: [
+      { value: 'responsive', label: 'In-Feed Stream Card (Responsive)' },
+      { value: '1200x628', label: '1200×628 Stream Card' },
+      { value: '1080x1080', label: '1080×1080 Square Card' },
+    ],
+    compatibleCreativeFormats: ['native', 'image', 'video', 'sponsored', 'responsive'],
+    defaultCreativeFormat: 'native',
+  },
+  video: {
+    format: 'video',
+    label: 'Video',
+    summary: 'Pre-roll, mid-roll, and out-stream video player slot optimized for 16:9, 9:16, and 1:1 assets.',
+    defaultDimensions: '16:9',
+    dimensionsOptions: [
+      { value: '16:9', label: '16:9 Widescreen' },
+      { value: '9:16', label: '9:16 Vertical Feed' },
+      { value: '1:1', label: '1:1 Square Video' },
+    ],
+    compatibleCreativeFormats: ['video', 'responsive'],
+    defaultCreativeFormat: 'video',
+  },
+  interstitial: {
+    format: 'interstitial',
+    label: 'Interstitial',
+    summary: 'High-impact transitional overlay supporting display banners, full-bleed images, video, and responsive cards.',
+    defaultDimensions: '300x250',
+    dimensionsOptions: [
+      { value: '300x250', label: '300×250 Modal Card' },
+      { value: '1080x1080', label: '1080×1080 Square Overlay' },
+      { value: '1200x628', label: '1200×628 Landscape Overlay' },
+    ],
+    compatibleCreativeFormats: ['image', 'banner', 'video', 'responsive'],
+    defaultCreativeFormat: 'image',
+  },
+};
+
+export function getPlacementFormatSpec(format: string): PlacementFormatSpec {
+  if (format in PLACEMENT_FORMAT_SPECS) {
+    return PLACEMENT_FORMAT_SPECS[format as PlacementFormat];
+  }
+  return PLACEMENT_FORMAT_SPECS.native;
+}
+
+export function applyPlacementFormatChange<T extends { format: string; dimensions: string }>(
+  current: T,
+  nextPlacementFormat: string
+): T {
+  const spec = getPlacementFormatSpec(nextPlacementFormat);
+  const allowedDims = spec.dimensionsOptions.map((o) => o.value);
+  const nextDimensions = allowedDims.includes(current.dimensions)
+    ? current.dimensions
+    : spec.defaultDimensions;
+  return {
+    ...current,
+    format: spec.format,
+    dimensions: nextDimensions,
+  };
+}
+
+export interface FormatSampleCreative {
+  title: string;
+  description: string;
+  ctaText: string;
+  destinationUrl: string;
+  mediaUrl: string;
+}
+
+export const FORMAT_SAMPLE_CREATIVES: Record<AdFormat, FormatSampleCreative> = {
+  native: {
+    title: 'Multi-Currency Treasury Accounts Built for Global Teams',
+    description:
+      'Settle supplier invoices in 24 currencies with real-time FX tracking and transparent ledger reconciliation.',
+    ctaText: 'Explore Treasury',
+    destinationUrl: 'https://atlascommerce.io/treasury',
+    mediaUrl: '/src/assets/images/creative_fintech_card_1795552815861.jpg',
+  },
+  banner: {
+    title: 'Dedicated Bare-Metal Compute Across 14 Regions',
+    description:
+      'Provision NVMe clusters in under 90 seconds with predictable bandwidth pricing and private peering.',
+    ctaText: 'Compare Plans',
+    destinationUrl: 'https://nordiccloud.de/bare-metal',
+    mediaUrl: '/src/assets/images/creative_cloud_hardware_1795552815294.jpg',
+  },
+  image: {
+    title: 'Precision Footwear Engineered for Long-Distance Comfort',
+    description:
+      'Breathable knit upper paired with carbon-stabilized cushioning. Direct shipping across North America and Europe.',
+    ctaText: 'Shop Collection',
+    destinationUrl: 'https://meridianrun.example/collection',
+    mediaUrl: '/src/assets/images/creative_retail_sneaker_1795552816794.jpg',
+  },
+  responsive: {
+    title: 'Unified Inventory & Demand Forecasting for Modern Retail',
+    description:
+      'Connect ERP and storefront data to reduce stockouts and automate replenishment across every warehouse.',
+    ctaText: 'Book Walkthrough',
+    destinationUrl: 'https://atlascommerce.io/retail',
+    mediaUrl: '/src/assets/images/hero_adtech_network_1795552814854.jpg',
+  },
+  text: {
+    title: 'Automate Quarterly Tax Filings for Distributed Contractors',
+    description:
+      'Generate compliant 1099 and W-8BEN packets across 45 jurisdictions with zero spreadsheet reconciliation.',
+    ctaText: 'Start Free Audit',
+    destinationUrl: 'https://ledgerflow.example/tax',
+    mediaUrl: '',
+  },
+  video: {
+    title: 'Inside the Next-Generation Electric Fleet Platform',
+    description:
+      'Watch a 15-second walkthrough of live route telemetry, predictive battery diagnostics, and depot scheduling.',
+    ctaText: 'Watch Demo',
+    destinationUrl: 'https://voltshift.example/demo',
+    mediaUrl: '/src/assets/images/hero_looma_exchange_1795555655659.jpg',
+  },
+  sponsored: {
+    title: 'How Independent Media Houses Protect Direct Ad Yield',
+    description:
+      'A practical guide to first-price auctions, ads.txt verification, and eliminating hidden ad-tech intermediary fees.',
+    ctaText: 'Read Editorial',
+    destinationUrl: 'https://looma-ads.com/editorial-guide',
+    mediaUrl: '/src/assets/images/publisher_editorial_desk_1795555659074.jpg',
+  },
+};
+
+export function getSampleCreativeForFormat(format: string): FormatSampleCreative {
+  const spec = getAdFormatSpec(format);
+  return FORMAT_SAMPLE_CREATIVES[spec.format];
+}
+

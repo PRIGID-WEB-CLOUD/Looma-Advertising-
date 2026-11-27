@@ -5,7 +5,10 @@ import {
   AD_FORMAT_SPECS,
   DEFAULT_IMAGE_ASSET,
   applyFormatChange,
+  applyPlacementFormatChange,
   getAdFormatSpec,
+  getPlacementFormatSpec,
+  getSampleCreativeForFormat,
   updateTrackingParamMedium,
   validateCreativeForFormat,
 } from './adFormats.js';
@@ -139,4 +142,37 @@ test('validateCreativeForFormat enforces media requirements for banner/image and
       mediaUrl: '/api/media/demo.mp4',
     })
   );
+});
+
+test('placement format specs expose compatible creative formats and auto-adapt slot dimensions', () => {
+  const bannerSlot = applyPlacementFormatChange({ format: 'native', dimensions: 'responsive' }, 'banner');
+  assert.equal(bannerSlot.format, 'banner');
+  assert.equal(bannerSlot.dimensions, '728x90');
+
+  const videoSlot = applyPlacementFormatChange(bannerSlot, 'video');
+  assert.equal(videoSlot.format, 'video');
+  assert.equal(videoSlot.dimensions, '16:9');
+
+  const inFeedSpec = getPlacementFormatSpec('in_feed');
+  assert.ok(inFeedSpec.compatibleCreativeFormats.includes('native'));
+  assert.ok(inFeedSpec.compatibleCreativeFormats.includes('video'));
+  assert.equal(inFeedSpec.defaultCreativeFormat, 'native');
+
+  const fallbackSpec = getPlacementFormatSpec('unknown_slot');
+  assert.equal(fallbackSpec.format, 'native');
+});
+
+test('getSampleCreativeForFormat returns complete preview creative payloads for every format', () => {
+  for (const format of AD_FORMATS) {
+    const sample = getSampleCreativeForFormat(format);
+    assert.ok(sample.title.length > 0);
+    assert.ok(sample.description.length > 0);
+    assert.ok(sample.ctaText.length > 0);
+    assert.ok(sample.destinationUrl.startsWith('https://'));
+    if (format === 'text') {
+      assert.equal(sample.mediaUrl, '');
+    } else {
+      assert.ok(sample.mediaUrl.length > 0);
+    }
+  }
 });

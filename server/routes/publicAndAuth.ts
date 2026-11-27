@@ -1,6 +1,5 @@
 import crypto from 'node:crypto';
-import { Router, type Request, type Response } from 'express';
-import type { DatabaseSync } from 'node:sqlite';
+import { createAppRouter, type AppRouter, type Request, type Response } from '../http/router';
 import {
   AuthenticatedRequest,
   createAuthMiddleware,
@@ -10,7 +9,7 @@ import {
   timingSafeSecretMatch,
   verifyPassword,
 } from '../auth';
-import { withTransaction } from '../db';
+import { withTransaction, type DbClient } from '../db/postgres';
 import { checkPersistentRateLimit } from '../jobs';
 import {
   buildOtpAuthUri,
@@ -45,17 +44,26 @@ function sha256Hex(value: string): string {
 }
 
 function getClientIp(req: Request): string {
-  return (req.ip || req.socket.remoteAddress || '127.0.0.1').toString();
+  return (req.ip || req.socket?.remoteAddress || '127.0.0.1').toString();
 }
 
-export function createPublicAndAuthRouter(db: DatabaseSync): Router {
-  const router = Router();
+export function createPublicAndAuthRouter(db: DbClient): AppRouter {
+  const router = createAppRouter();
   const requireAuth = createAuthMiddleware(db);
 
-  function isAdminClaimed(): boolean {
-    const row = db
-      .prepare("SELECT value_json FROM platform_settings WHERE key = 'admin_claimed'")
-      .get() as { value_json: string } | undefined;
+  async function isAdminClaimed(client: DbClient = db): Promise<boolean> {
+    const hasActiveAdmin = await client.queryOne(
+      `SELECT 1 AS ok
+       FROM users u
+       JOIN roles r ON r.id = u.role_id
+       WHERE r.name = 'admin' AND u.status = 'active'
+       LIMIT 1`
+    );
+    if (!hasActiveAdmin) return false;
+
+    const row = await client.queryOne<{ value_json: string }>(
+      "SELECT value_json FROM platform_settings WHERE key = 'admin_claimed'"
+    );
     if (!row) return false;
     try {
       return JSON.parse(row.value_json) === true;
@@ -65,29 +73,26 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
   }
 
   // GET /api/public/overview
-  router.get('/public/overview', (_req: Request, res: Response) => {
-    const stats = db
-      .prepare(
-        `SELECT
-           (SELECT COUNT(*) FROM campaigns WHERE status = 'active') AS active_campaigns,
-           (SELECT COUNT(*) FROM publisher_properties WHERE approval_status = 'approved') AS approved_properties,
-           (SELECT COUNT(*) FROM impressions WHERE is_valid = 1) AS total_impressions,
-           (SELECT COUNT(*) FROM ad_placements WHERE status = 'active') AS active_placements`
-      )
-      .get();
+  router.get('/public/overview', async (_req: Request, res: Response) => {
+    const stats = await db.queryOne(
+      `SELECT
+         (SELECT COUNT(*) FROM campaigns WHERE status = 'active') AS active_campaigns,
+         (SELECT COUNT(*) FROM publisher_properties WHERE approval_status = 'approved') AS approved_properties,
+         (SELECT COUNT(*) FROM impressions WHERE is_valid = 1) AS total_impressions,
+         (SELECT COUNT(*) FROM ad_placements WHERE status = 'active') AS active_placements`
+    );
 
-    const featureFlags = getFeatureFlags(db);
-    const activePlacements = db
-      .prepare(
-        `SELECT ap.id, ap.name, ap.format, ap.dimensions, pp.name AS property_name, pp.domain_or_bundle, pp.category,
-                pub.publisher_type
-         FROM ad_placements ap
-         JOIN publisher_properties pp ON pp.id = ap.property_id
-         JOIN publisher_accounts pub ON pub.id = ap.publisher_id
-         WHERE ap.status = 'active' AND pp.approval_status = 'approved'
-           AND (pub.publisher_type = 'first_party' OR ? = 1)`
-      )
-      .all(featureFlags.third_party_sdk_distribution_enabled || !featureFlags.looma_first_party_only_mode ? 1 : 0);
+    const featureFlags = await getFeatureFlags(db);
+    const activePlacements = await db.query(
+      `SELECT ap.id, ap.name, ap.format, ap.dimensions, pp.name AS property_name, pp.domain_or_bundle, pp.category,
+              pub.publisher_type
+       FROM ad_placements ap
+       JOIN publisher_properties pp ON pp.id = ap.property_id
+       JOIN publisher_accounts pub ON pub.id = ap.publisher_id
+       WHERE ap.status = 'active' AND pp.approval_status = 'approved'
+         AND (pub.publisher_type = 'first_party' OR ? = 1)`,
+      [featureFlags.third_party_sdk_distribution_enabled || !featureFlags.looma_first_party_only_mode ? 1 : 0]
+    );
 
     res.json({
       stats,
@@ -110,8 +115,8 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
   });
 
   // POST /api/public/contact
-  router.post('/public/contact', (req: Request, res: Response) => {
-    if (!checkPersistentRateLimit(db, `pub_contact:${getClientIp(req)}`, 10)) {
+  router.post('/public/contact', async (req: Request, res: Response) => {
+    if (!(await checkPersistentRateLimit(db, `pub_contact:${getClientIp(req)}`, 10))) {
       res.status(429).json({ error: 'Too many inquiries submitted. Please try again shortly.' });
       return;
     }
@@ -123,16 +128,17 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
     const { name, email, company, interest, message } = validation.value;
 
     const id = `inq_${crypto.randomUUID().slice(0, 10)}`;
-    db.prepare(
-      `INSERT INTO contact_inquiries (id, name, email, company, interest, message) VALUES (?, ?, ?, ?, ?, ?)`
-    ).run(id, name, email, company, interest, message);
+    await db.execute(
+      `INSERT INTO contact_inquiries (id, name, email, company, interest, message) VALUES (?, ?, ?, ?, ?, ?)`,
+      [id, name, email, company, interest, message]
+    );
 
     res.status(201).json({ received: true, inquiryId: id });
   });
 
   // POST /api/public/privacy-request
-  router.post('/public/privacy-request', (req: Request, res: Response) => {
-    if (!checkPersistentRateLimit(db, `pub_privacy:${getClientIp(req)}`, 10)) {
+  router.post('/public/privacy-request', async (req: Request, res: Response) => {
+    if (!(await checkPersistentRateLimit(db, `pub_privacy:${getClientIp(req)}`, 10))) {
       res.status(429).json({ error: 'Too many privacy requests submitted. Please try again shortly.' });
       return;
     }
@@ -144,24 +150,25 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
     const { email, requestType, jurisdiction, details } = validation.value;
 
     const id = `prv_${crypto.randomUUID().slice(0, 10)}`;
-    db.prepare(
-      `INSERT INTO privacy_requests (id, email, request_type, jurisdiction, details) VALUES (?, ?, ?, ?, ?)`
-    ).run(id, email, requestType, jurisdiction, details);
+    await db.execute(
+      `INSERT INTO privacy_requests (id, email, request_type, jurisdiction, details) VALUES (?, ?, ?, ?, ?)`,
+      [id, email, requestType, jurisdiction, details]
+    );
 
     res.status(201).json({ submitted: true, requestId: id });
   });
 
   // GET /api/auth/admin-setup-status
-  router.get('/auth/admin-setup-status', (_req: Request, res: Response) => {
+  router.get('/auth/admin-setup-status', async (_req: Request, res: Response) => {
     res.json({
-      adminClaimed: isAdminClaimed(),
+      adminClaimed: await isAdminClaimed(),
       envPasscodeConfigured: Boolean(process.env.ADMIN_PASSCODE?.trim()),
     });
   });
 
   // POST /api/auth/admin-claim — One-time initial administrator setup when ADMIN_PASSCODE is not set
-  router.post('/auth/admin-claim', (req: Request, res: Response) => {
-    if (!checkPersistentRateLimit(db, `auth_admin_claim:${getClientIp(req)}`, 5)) {
+  router.post('/auth/admin-claim', async (req: Request, res: Response) => {
+    if (!(await checkPersistentRateLimit(db, `auth_admin_claim:${getClientIp(req)}`, 5))) {
       res.status(429).json({ error: 'Too many setup attempts. Please wait a minute and try again.' });
       return;
     }
@@ -169,7 +176,7 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
       res.status(403).json({ error: 'Administrator access is managed by ADMIN_PASSCODE. Sign in normally.' });
       return;
     }
-    if (isAdminClaimed()) {
+    if (await isAdminClaimed()) {
       res.status(403).json({ error: 'Administrator credentials have already been claimed. Please sign in.' });
       return;
     }
@@ -181,46 +188,52 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
     }
     const { email: normalizedEmail, fullName: cleanName, password } = claimValidation.value;
 
-    const existingOther = db
-      .prepare("SELECT id FROM users WHERE email = ? AND id != 'usr_admin_1'")
-      .get(normalizedEmail);
+    const existingOther = await db.queryOne(
+      "SELECT id FROM users WHERE email = ? AND id != 'usr_admin_1'",
+      [normalizedEmail]
+    );
     if (existingOther) {
       res.status(409).json({ error: 'That email address is already registered to another account' });
       return;
     }
 
     const claimedNow = Date.now() + 1;
+    const nowIso = new Date().toISOString();
     const passwordHash = hashPassword(String(password));
 
-    const outcome = withTransaction(db, () => {
-      if (isAdminClaimed()) {
+    const outcome = await withTransaction(db, async (tx) => {
+      if (await isAdminClaimed(tx)) {
         return { alreadyClaimed: true as const };
       }
-      const adminRow = db.prepare("SELECT id FROM users WHERE id = 'usr_admin_1'").get() as { id: string } | undefined;
+      const adminRow = await tx.queryOne<{ id: string }>("SELECT id FROM users WHERE id = 'usr_admin_1'");
       if (!adminRow) {
-        db.prepare(
+        await tx.execute(
           `INSERT INTO users (id, email, full_name, password_hash, role_id, status, email_verified, token_valid_after)
-           VALUES ('usr_admin_1', ?, ?, ?, 'role_admin', 'active', 1, ?)`
-        ).run(normalizedEmail, cleanName, passwordHash, claimedNow);
+           VALUES ('usr_admin_1', ?, ?, ?, 'role_admin', 'active', 1, ?)`,
+          [normalizedEmail, cleanName, passwordHash, claimedNow]
+        );
       } else {
-        db.prepare(
+        await tx.execute(
           `UPDATE users
            SET email = ?, full_name = ?, password_hash = ?, status = 'active', email_verified = 1,
-               token_valid_after = ?, updated_at = datetime('now')
-           WHERE id = 'usr_admin_1'`
-        ).run(normalizedEmail, cleanName, passwordHash, claimedNow);
+               token_valid_after = ?, updated_at = ?
+           WHERE id = 'usr_admin_1'`,
+          [normalizedEmail, cleanName, passwordHash, claimedNow, nowIso]
+        );
       }
 
-      db.prepare(
+      await tx.execute(
         `INSERT INTO platform_settings (key, value_json, updated_at)
-         VALUES ('admin_claimed', 'true', datetime('now'))
-         ON CONFLICT(key) DO UPDATE SET value_json = 'true', updated_at = datetime('now')`
-      ).run();
+         VALUES ('admin_claimed', 'true', ?)
+         ON CONFLICT (key) DO UPDATE SET value_json = 'true', updated_at = ?`,
+        [nowIso, nowIso]
+      );
 
-      db.prepare(
+      await tx.execute(
         `INSERT INTO audit_logs (id, actor_user_id, action, resource_type, resource_id, details_json)
-         VALUES (?, 'usr_admin_1', 'admin_credentials_claimed', 'user', 'usr_admin_1', ?)`
-      ).run(`aud_${crypto.randomUUID().slice(0, 12)}`, JSON.stringify({ email: normalizedEmail }));
+         VALUES (?, 'usr_admin_1', 'admin_credentials_claimed', 'user', 'usr_admin_1', ?)`,
+        [`aud_${crypto.randomUUID().slice(0, 12)}`, JSON.stringify({ email: normalizedEmail })]
+      );
 
       return { alreadyClaimed: false as const };
     });
@@ -241,8 +254,8 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
   });
 
   // POST /api/auth/register
-  router.post('/auth/register', (req: Request, res: Response) => {
-    if (!checkPersistentRateLimit(db, `auth_register:${getClientIp(req)}`, 10)) {
+  router.post('/auth/register', async (req: Request, res: Response) => {
+    if (!(await checkPersistentRateLimit(db, `auth_register:${getClientIp(req)}`, 10))) {
       res.status(429).json({ error: 'Too many registration attempts. Please try again later.' });
       return;
     }
@@ -252,7 +265,8 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
       return;
     }
     const { email: normalizedEmail, fullName, password, role, organizationName, country } = regValidation.value;
-    if (role === 'publisher' && !getFeatureFlags(db).external_publisher_registration_enabled) {
+    const flags = await getFeatureFlags(db);
+    if (role === 'publisher' && !flags.external_publisher_registration_enabled) {
       res.status(403).json({
         error:
           'External publisher registration is disabled at initial launch. Looma is the exclusive active first-party publisher.',
@@ -260,7 +274,7 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
       return;
     }
 
-    const existing = db.prepare('SELECT id FROM users WHERE email = ?').get(normalizedEmail);
+    const existing = await db.queryOne('SELECT id FROM users WHERE email = ?', [normalizedEmail]);
     if (existing) {
       res.status(409).json({ error: 'An account with this email already exists' });
       return;
@@ -270,33 +284,38 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
     const roleId = role === 'publisher' ? 'role_publisher' : 'role_advertiser';
     const passwordHash = hashPassword(String(password));
 
-    withTransaction(db, () => {
-      db.prepare(
-        `INSERT INTO users (id, email, full_name, password_hash, role_id, status) VALUES (?, ?, ?, ?, ?, 'active')`
-      ).run(userId, normalizedEmail, String(fullName).trim(), passwordHash, roleId);
+    await withTransaction(db, async (tx) => {
+      await tx.execute(
+        `INSERT INTO users (id, email, full_name, password_hash, role_id, status) VALUES (?, ?, ?, ?, ?, 'active')`,
+        [userId, normalizedEmail, String(fullName).trim(), passwordHash, roleId]
+      );
 
       if (role === 'advertiser') {
         const advId = `adv_${crypto.randomUUID().slice(0, 10)}`;
-        db.prepare(
+        await tx.execute(
           `INSERT INTO advertiser_accounts (id, user_id, company_name, country, currency, verification_status, account_status, billing_email)
-           VALUES (?, ?, ?, ?, 'USD', 'pending', 'active', ?)`
-        ).run(advId, userId, String(organizationName).trim(), String(country), normalizedEmail);
+           VALUES (?, ?, ?, ?, 'USD', 'pending', 'active', ?)`,
+          [advId, userId, String(organizationName).trim(), String(country), normalizedEmail]
+        );
 
-        db.prepare(
+        await tx.execute(
           `INSERT INTO advertiser_wallets (id, advertiser_id, available_micros, reserved_micros, lifetime_deposited_micros, lifetime_spent_micros, currency)
-           VALUES (?, ?, 0, 0, 0, 0, 'USD')`
-        ).run(`wal_${crypto.randomUUID().slice(0, 10)}`, advId);
+           VALUES (?, ?, 0, 0, 0, 0, 'USD')`,
+          [`wal_${crypto.randomUUID().slice(0, 10)}`, advId]
+        );
       } else {
         const pubId = `pub_${crypto.randomUUID().slice(0, 10)}`;
-        db.prepare(
+        await tx.execute(
           `INSERT INTO publisher_accounts (id, user_id, organization_name, country, currency, publisher_type, approval_status, traffic_quality_score)
-           VALUES (?, ?, ?, ?, 'USD', 'third_party', 'pending', 90)`
-        ).run(pubId, userId, String(organizationName).trim(), String(country));
+           VALUES (?, ?, ?, ?, 'USD', 'third_party', 'pending', 90)`,
+          [pubId, userId, String(organizationName).trim(), String(country)]
+        );
 
-        db.prepare(
+        await tx.execute(
           `INSERT INTO publisher_wallets (id, publisher_id, estimated_micros, available_micros, pending_micros, lifetime_earned_micros, invalid_deducted_micros, currency)
-           VALUES (?, ?, 0, 0, 0, 0, 0, 'USD')`
-        ).run(`wal_${crypto.randomUUID().slice(0, 10)}`, pubId);
+           VALUES (?, ?, 0, 0, 0, 0, 0, 'USD')`,
+          [`wal_${crypto.randomUUID().slice(0, 10)}`, pubId]
+        );
       }
     });
 
@@ -308,8 +327,8 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
   });
 
   // POST /api/auth/login
-  router.post('/auth/login', (req: Request, res: Response) => {
-    if (!checkPersistentRateLimit(db, `auth_login:${getClientIp(req)}`, 15)) {
+  router.post('/auth/login', async (req: Request, res: Response) => {
+    if (!(await checkPersistentRateLimit(db, `auth_login:${getClientIp(req)}`, 15))) {
       res.status(429).json({ error: 'Too many sign-in attempts. Please wait a minute and try again.' });
       return;
     }
@@ -320,24 +339,21 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
     }
     const { email, password, totpCode } = loginValidation.value;
 
-    const row = db
-      .prepare(
-        `SELECT u.id, u.email, u.full_name, u.password_hash, u.status, u.token_valid_after, r.name AS role
-         FROM users u
-         JOIN roles r ON r.id = u.role_id
-         WHERE u.email = ?`
-      )
-      .get(email) as
-      | {
-          id: string;
-          email: string;
-          full_name: string;
-          password_hash: string;
-          status: string;
-          token_valid_after: number;
-          role: 'advertiser' | 'publisher' | 'admin';
-        }
-      | undefined;
+    const row = await db.queryOne<{
+      id: string;
+      email: string;
+      full_name: string;
+      password_hash: string;
+      status: string;
+      token_valid_after: number;
+      role: 'advertiser' | 'publisher' | 'admin';
+    }>(
+      `SELECT u.id, u.email, u.full_name, u.password_hash, u.status, u.token_valid_after, r.name AS role
+       FROM users u
+       JOIN roles r ON r.id = u.role_id
+       WHERE u.email = ?`,
+      [email]
+    );
 
     const envAdminPasscode = process.env.ADMIN_PASSCODE?.trim();
     const passwordMatches = row
@@ -357,12 +373,14 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
     }
 
     // Enforce RFC 6238 TOTP 2FA if user has verified authenticator enrollment
-    const totpRow = db
-      .prepare('SELECT secret_base32, verified FROM totp_secrets WHERE user_id = ?')
-      .get(row.id) as { secret_base32: string; verified: number } | undefined;
-    const prefRow = db
-      .prepare('SELECT two_factor_enabled FROM user_preferences WHERE user_id = ?')
-      .get(row.id) as { two_factor_enabled: number } | undefined;
+    const totpRow = await db.queryOne<{ secret_base32: string; verified: number }>(
+      'SELECT secret_base32, verified FROM totp_secrets WHERE user_id = ?',
+      [row.id]
+    );
+    const prefRow = await db.queryOne<{ two_factor_enabled: number }>(
+      'SELECT two_factor_enabled FROM user_preferences WHERE user_id = ?',
+      [row.id]
+    );
 
     if (totpRow?.verified && prefRow?.two_factor_enabled) {
       if (!totpCode) {
@@ -380,7 +398,7 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
 
     const token = signSessionToken(
       { userId: row.id, email: row.email, role: row.role },
-      row.token_valid_after || undefined
+      Number(row.token_valid_after || 0) || undefined
     );
     res.json({
       token,
@@ -389,18 +407,19 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
   });
 
   // POST /api/auth/logout — Immediately revokes the active Bearer token server-side
-  router.post('/auth/logout', requireAuth, (req: AuthenticatedRequest, res: Response) => {
+  router.post('/auth/logout', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
     if (req.rawToken && req.auth) {
-      revokeSessionToken(db, req.rawToken, req.auth.exp);
+      await revokeSessionToken(db, req.rawToken, req.auth.exp);
     }
     res.json({ loggedOut: true });
   });
 
   // POST /api/auth/request-email-verification
-  router.post('/auth/request-email-verification', requireAuth, (req: AuthenticatedRequest, res: Response) => {
-    const user = db.prepare('SELECT id, email, email_verified FROM users WHERE id = ?').get(req.auth!.userId) as
-      | { id: string; email: string; email_verified: number }
-      | undefined;
+  router.post('/auth/request-email-verification', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+    const user = await db.queryOne<{ id: string; email: string; email_verified: number }>(
+      'SELECT id, email, email_verified FROM users WHERE id = ?',
+      [req.auth!.userId]
+    );
     if (!user) {
       res.status(404).json({ error: 'User not found' });
       return;
@@ -413,13 +432,15 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
     const code = String(crypto.randomInt(100000, 999999));
     const tokenHash = sha256Hex(code);
     const tokenId = `tok_${crypto.randomUUID().slice(0, 10)}`;
+    const expiresAtIso = new Date(Date.now() + 30 * 60_000).toISOString();
 
-    db.prepare(
+    await db.execute(
       `INSERT INTO auth_tokens (id, user_id, token_type, token_hash, expires_at)
-       VALUES (?, ?, 'email_verify', ?, datetime('now', '+30 minutes'))`
-    ).run(tokenId, user.id, tokenHash);
+       VALUES (?, ?, 'email_verify', ?, ?)`,
+      [tokenId, user.id, tokenHash, expiresAtIso]
+    );
 
-    queueTransactionalEmail(db, {
+    await queueTransactionalEmail(db, {
       to: user.email,
       subject: 'Looma Advertising — Verify Your Email Address',
       bodyText: `Your email verification code is ${code}. This code expires in 30 minutes.`,
@@ -432,7 +453,7 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
   });
 
   // POST /api/auth/verify-email
-  router.post('/auth/verify-email', requireAuth, (req: AuthenticatedRequest, res: Response) => {
+  router.post('/auth/verify-email', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
     const codeErr = validateSixDigitCode(req.body?.code, 'Verification code');
     if (codeErr) {
       res.status(400).json({ error: codeErr, fieldErrors: { code: codeErr } });
@@ -440,31 +461,32 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
     }
     const code = asTrimmedString(req.body?.code) || '';
     const tokenHash = sha256Hex(code);
-    const tokenRow = db
-      .prepare(
-        `SELECT id FROM auth_tokens
-         WHERE user_id = ? AND token_type = 'email_verify' AND token_hash = ?
-           AND consumed_at IS NULL AND expires_at >= datetime('now')
-         ORDER BY created_at DESC LIMIT 1`
-      )
-      .get(req.auth!.userId, tokenHash) as { id: string } | undefined;
+    const nowIso = new Date().toISOString();
+
+    const tokenRow = await db.queryOne<{ id: string }>(
+      `SELECT id FROM auth_tokens
+       WHERE user_id = ? AND token_type = 'email_verify' AND token_hash = ?
+         AND consumed_at IS NULL AND expires_at >= ?
+       ORDER BY created_at DESC LIMIT 1`,
+      [req.auth!.userId, tokenHash, nowIso]
+    );
 
     if (!tokenRow) {
       res.status(400).json({ error: 'Invalid or expired verification code' });
       return;
     }
 
-    withTransaction(db, () => {
-      db.prepare("UPDATE auth_tokens SET consumed_at = datetime('now') WHERE id = ?").run(tokenRow.id);
-      db.prepare("UPDATE users SET email_verified = 1, updated_at = datetime('now') WHERE id = ?").run(req.auth!.userId);
+    await withTransaction(db, async (tx) => {
+      await tx.execute('UPDATE auth_tokens SET consumed_at = ? WHERE id = ?', [nowIso, tokenRow.id]);
+      await tx.execute('UPDATE users SET email_verified = 1, updated_at = ? WHERE id = ?', [nowIso, req.auth!.userId]);
     });
 
     res.json({ verified: true });
   });
 
   // POST /api/auth/forgot-password
-  router.post('/auth/forgot-password', (req: Request, res: Response) => {
-    if (!checkPersistentRateLimit(db, `auth_forgot:${getClientIp(req)}`, 5)) {
+  router.post('/auth/forgot-password', async (req: Request, res: Response) => {
+    if (!(await checkPersistentRateLimit(db, `auth_forgot:${getClientIp(req)}`, 5))) {
       res.status(429).json({ error: 'Too many password reset requests. Please try again later.' });
       return;
     }
@@ -475,19 +497,22 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
     }
     const normalizedEmail = forgotValidation.value.email;
 
-    const user = db.prepare('SELECT id, email, status FROM users WHERE email = ?').get(normalizedEmail) as
-      | { id: string; email: string; status: string }
-      | undefined;
+    const user = await db.queryOne<{ id: string; email: string; status: string }>(
+      'SELECT id, email, status FROM users WHERE email = ?',
+      [normalizedEmail]
+    );
 
     if (user && user.status === 'active') {
       const code = crypto.randomBytes(4).toString('hex').toUpperCase();
       const tokenHash = sha256Hex(code);
-      db.prepare(
+      const expiresAtIso = new Date(Date.now() + 30 * 60_000).toISOString();
+      await db.execute(
         `INSERT INTO auth_tokens (id, user_id, token_type, token_hash, expires_at)
-         VALUES (?, ?, 'password_reset', ?, datetime('now', '+30 minutes'))`
-      ).run(`tok_${crypto.randomUUID().slice(0, 10)}`, user.id, tokenHash);
+         VALUES (?, ?, 'password_reset', ?, ?)`,
+        [`tok_${crypto.randomUUID().slice(0, 10)}`, user.id, tokenHash, expiresAtIso]
+      );
 
-      queueTransactionalEmail(db, {
+      await queueTransactionalEmail(db, {
         to: user.email,
         subject: 'Looma Advertising — Password Reset Code',
         bodyText: `Use reset code ${code} within 30 minutes to choose a new password for your Looma Advertising account.`,
@@ -502,8 +527,8 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
   });
 
   // POST /api/auth/reset-password
-  router.post('/auth/reset-password', (req: Request, res: Response) => {
-    if (!checkPersistentRateLimit(db, `auth_reset:${getClientIp(req)}`, 10)) {
+  router.post('/auth/reset-password', async (req: Request, res: Response) => {
+    if (!(await checkPersistentRateLimit(db, `auth_reset:${getClientIp(req)}`, 10))) {
       res.status(429).json({ error: 'Too many password reset attempts. Please try again later.' });
       return;
     }
@@ -514,20 +539,20 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
     }
     const { email: normalizedEmail, token: cleanToken, newPassword } = resetValidation.value;
 
-    const user = db.prepare('SELECT id FROM users WHERE email = ?').get(normalizedEmail) as { id: string } | undefined;
+    const user = await db.queryOne<{ id: string }>('SELECT id FROM users WHERE email = ?', [normalizedEmail]);
     if (!user) {
       res.status(400).json({ error: 'Invalid or expired reset code' });
       return;
     }
 
-    const tokenRow = db
-      .prepare(
-        `SELECT id FROM auth_tokens
-         WHERE user_id = ? AND token_type = 'password_reset' AND token_hash = ?
-           AND consumed_at IS NULL AND expires_at >= datetime('now')
-         ORDER BY created_at DESC LIMIT 1`
-      )
-      .get(user.id, sha256Hex(cleanToken)) as { id: string } | undefined;
+    const nowIso = new Date().toISOString();
+    const tokenRow = await db.queryOne<{ id: string }>(
+      `SELECT id FROM auth_tokens
+       WHERE user_id = ? AND token_type = 'password_reset' AND token_hash = ?
+         AND consumed_at IS NULL AND expires_at >= ?
+       ORDER BY created_at DESC LIMIT 1`,
+      [user.id, sha256Hex(cleanToken), nowIso]
+    );
 
     if (!tokenRow) {
       res.status(400).json({ error: 'Invalid or expired reset code' });
@@ -535,32 +560,37 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
     }
 
     const invalidatedAt = Date.now() + 1;
-    withTransaction(db, () => {
-      db.prepare("UPDATE auth_tokens SET consumed_at = datetime('now') WHERE id = ?").run(tokenRow.id);
-      db.prepare(
-        "UPDATE users SET password_hash = ?, token_valid_after = ?, updated_at = datetime('now') WHERE id = ?"
-      ).run(hashPassword(String(newPassword)), invalidatedAt, user.id);
+    const newHash = hashPassword(String(newPassword));
+    await withTransaction(db, async (tx) => {
+      await tx.execute('UPDATE auth_tokens SET consumed_at = ? WHERE id = ?', [nowIso, tokenRow.id]);
+      await tx.execute(
+        'UPDATE users SET password_hash = ?, token_valid_after = ?, updated_at = ? WHERE id = ?',
+        [newHash, invalidatedAt, nowIso, user.id]
+      );
     });
 
     res.json({ reset: true });
   });
 
   // POST /api/auth/2fa/setup
-  router.post('/auth/2fa/setup', requireAuth, (req: AuthenticatedRequest, res: Response) => {
-    const user = db.prepare('SELECT id, email FROM users WHERE id = ?').get(req.auth!.userId) as
-      | { id: string; email: string }
-      | undefined;
+  router.post('/auth/2fa/setup', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+    const user = await db.queryOne<{ id: string; email: string }>(
+      'SELECT id, email FROM users WHERE id = ?',
+      [req.auth!.userId]
+    );
     if (!user) {
       res.status(404).json({ error: 'User not found' });
       return;
     }
 
     const secretBase32 = generateBase32Secret(20);
-    db.prepare(
+    const nowIso = new Date().toISOString();
+    await db.execute(
       `INSERT INTO totp_secrets (user_id, secret_base32, verified, updated_at)
-       VALUES (?, ?, 0, datetime('now'))
-       ON CONFLICT(user_id) DO UPDATE SET secret_base32 = excluded.secret_base32, verified = 0, updated_at = datetime('now')`
-    ).run(user.id, secretBase32);
+       VALUES (?, ?, 0, ?)
+       ON CONFLICT (user_id) DO UPDATE SET secret_base32 = EXCLUDED.secret_base32, verified = 0, updated_at = ?`,
+      [user.id, secretBase32, nowIso, nowIso]
+    );
 
     res.json({
       secretBase32,
@@ -569,16 +599,17 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
   });
 
   // POST /api/auth/2fa/verify
-  router.post('/auth/2fa/verify', requireAuth, (req: AuthenticatedRequest, res: Response) => {
+  router.post('/auth/2fa/verify', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
     const codeErr = validateSixDigitCode(req.body?.code, 'Authenticator code');
     if (codeErr) {
       res.status(400).json({ error: codeErr, fieldErrors: { code: codeErr } });
       return;
     }
     const code = asTrimmedString(req.body?.code) || '';
-    const row = db.prepare('SELECT secret_base32 FROM totp_secrets WHERE user_id = ?').get(req.auth!.userId) as
-      | { secret_base32: string }
-      | undefined;
+    const row = await db.queryOne<{ secret_base32: string }>(
+      'SELECT secret_base32 FROM totp_secrets WHERE user_id = ?',
+      [req.auth!.userId]
+    );
     if (!row) {
       res.status(400).json({ error: 'Generate a 2FA secret before verifying' });
       return;
@@ -588,25 +619,29 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
       return;
     }
 
-    getOrCreatePrefs(req.auth!.userId);
-    withTransaction(db, () => {
-      db.prepare("UPDATE totp_secrets SET verified = 1, updated_at = datetime('now') WHERE user_id = ?").run(req.auth!.userId);
-      db.prepare("UPDATE user_preferences SET two_factor_enabled = 1, updated_at = datetime('now') WHERE user_id = ?").run(
-        req.auth!.userId
-      );
+    await getOrCreatePrefs(req.auth!.userId);
+    const nowIso = new Date().toISOString();
+    await withTransaction(db, async (tx) => {
+      await tx.execute('UPDATE totp_secrets SET verified = 1, updated_at = ? WHERE user_id = ?', [nowIso, req.auth!.userId]);
+      await tx.execute('UPDATE user_preferences SET two_factor_enabled = 1, updated_at = ? WHERE user_id = ?', [
+        nowIso,
+        req.auth!.userId,
+      ]);
     });
 
     res.json({ enabled: true });
   });
 
   // POST /api/auth/2fa/disable
-  router.post('/auth/2fa/disable', requireAuth, (req: AuthenticatedRequest, res: Response) => {
-    getOrCreatePrefs(req.auth!.userId);
-    withTransaction(db, () => {
-      db.prepare("UPDATE totp_secrets SET verified = 0, updated_at = datetime('now') WHERE user_id = ?").run(req.auth!.userId);
-      db.prepare("UPDATE user_preferences SET two_factor_enabled = 0, updated_at = datetime('now') WHERE user_id = ?").run(
-        req.auth!.userId
-      );
+  router.post('/auth/2fa/disable', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+    await getOrCreatePrefs(req.auth!.userId);
+    const nowIso = new Date().toISOString();
+    await withTransaction(db, async (tx) => {
+      await tx.execute('UPDATE totp_secrets SET verified = 0, updated_at = ? WHERE user_id = ?', [nowIso, req.auth!.userId]);
+      await tx.execute('UPDATE user_preferences SET two_factor_enabled = 0, updated_at = ? WHERE user_id = ?', [
+        nowIso,
+        req.auth!.userId,
+      ]);
     });
     res.json({ disabled: true });
   });
@@ -619,15 +654,14 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
   });
 
   // GET /api/auth/me
-  router.get('/auth/me', requireAuth, (req: AuthenticatedRequest, res: Response) => {
-    const row = db
-      .prepare(
-        `SELECT u.id, u.email, u.full_name, r.name AS role
-         FROM users u
-         JOIN roles r ON r.id = u.role_id
-         WHERE u.id = ?`
-      )
-      .get(req.auth!.userId);
+  router.get('/auth/me', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+    const row = await db.queryOne(
+      `SELECT u.id, u.email, u.full_name, r.name AS role
+       FROM users u
+       JOIN roles r ON r.id = u.role_id
+       WHERE u.id = ?`,
+      [req.auth!.userId]
+    );
     if (!row) {
       res.status(404).json({ error: 'User not found' });
       return;
@@ -636,14 +670,12 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
   });
 
   // Helper to ensure user_preferences row exists
-  function getOrCreatePrefs(userId: string) {
-    db.prepare(`INSERT OR IGNORE INTO user_preferences (user_id) VALUES (?)`).run(userId);
-    return db
-      .prepare(
-        `SELECT timezone, preferred_currency, compact_density, email_alerts, fraud_alerts, weekly_digest, two_factor_enabled, session_timeout_minutes
-         FROM user_preferences WHERE user_id = ?`
-      )
-      .get(userId) as {
+  async function getOrCreatePrefs(userId: string) {
+    await db.execute(
+      `INSERT INTO user_preferences (user_id) VALUES (?) ON CONFLICT (user_id) DO NOTHING`,
+      [userId]
+    );
+    return (await db.queryOne<{
       timezone: string;
       preferred_currency: string;
       compact_density: number;
@@ -652,29 +684,30 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
       weekly_digest: number;
       two_factor_enabled: number;
       session_timeout_minutes: number;
-    };
+    }>(
+      `SELECT timezone, preferred_currency, compact_density, email_alerts, fraud_alerts, weekly_digest, two_factor_enabled, session_timeout_minutes
+       FROM user_preferences WHERE user_id = ?`,
+      [userId]
+    ))!;
   }
 
   // GET /api/auth/account
-  router.get('/auth/account', requireAuth, (req: AuthenticatedRequest, res: Response) => {
-    const userRow = db
-      .prepare(
-        `SELECT u.id, u.email, u.full_name, u.status, u.email_verified, u.created_at, r.name AS role
-         FROM users u
-         JOIN roles r ON r.id = u.role_id
-         WHERE u.id = ?`
-      )
-      .get(req.auth!.userId) as
-      | {
-          id: string;
-          email: string;
-          full_name: string;
-          status: string;
-          email_verified: number;
-          created_at: string;
-          role: string;
-        }
-      | undefined;
+  router.get('/auth/account', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+    const userRow = await db.queryOne<{
+      id: string;
+      email: string;
+      full_name: string;
+      status: string;
+      email_verified: number;
+      created_at: string;
+      role: string;
+    }>(
+      `SELECT u.id, u.email, u.full_name, u.status, u.email_verified, u.created_at, r.name AS role
+       FROM users u
+       JOIN roles r ON r.id = u.role_id
+       WHERE u.id = ?`,
+      [req.auth!.userId]
+    );
 
     if (!userRow) {
       res.status(404).json({ error: 'User not found' });
@@ -686,33 +719,35 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
     let contactEmail = userRow.email;
 
     if (userRow.role === 'advertiser') {
-      const adv = db
-        .prepare('SELECT company_name, country, billing_email FROM advertiser_accounts WHERE user_id = ?')
-        .get(userRow.id) as { company_name: string; country: string; billing_email: string } | undefined;
+      const adv = await db.queryOne<{ company_name: string; country: string; billing_email: string }>(
+        'SELECT company_name, country, billing_email FROM advertiser_accounts WHERE user_id = ?',
+        [userRow.id]
+      );
       if (adv) {
         organizationName = adv.company_name;
         country = adv.country;
         contactEmail = adv.billing_email;
       }
     } else if (userRow.role === 'publisher') {
-      const pub = db
-        .prepare('SELECT organization_name, country, payout_destination FROM publisher_accounts WHERE user_id = ?')
-        .get(userRow.id) as { organization_name: string; country: string; payout_destination: string } | undefined;
+      const pub = await db.queryOne<{ organization_name: string; country: string; payout_destination: string }>(
+        'SELECT organization_name, country, payout_destination FROM publisher_accounts WHERE user_id = ?',
+        [userRow.id]
+      );
       if (pub) {
         organizationName = pub.organization_name;
         country = pub.country;
       }
     }
 
-    const prefs = getOrCreatePrefs(userRow.id);
-    const totpRow = db
-      .prepare('SELECT verified FROM totp_secrets WHERE user_id = ?')
-      .get(userRow.id) as { verified: number } | undefined;
-    const recentEmails = db
-      .prepare(
-        'SELECT id, subject, category, delivery_status, created_at FROM email_outbox WHERE recipient_email = ? ORDER BY created_at DESC LIMIT 5'
-      )
-      .all(userRow.email);
+    const prefs = await getOrCreatePrefs(userRow.id);
+    const totpRow = await db.queryOne<{ verified: number }>(
+      'SELECT verified FROM totp_secrets WHERE user_id = ?',
+      [userRow.id]
+    );
+    const recentEmails = await db.query(
+      'SELECT id, subject, category, delivery_status, created_at FROM email_outbox WHERE recipient_email = ? ORDER BY created_at DESC LIMIT 5',
+      [userRow.email]
+    );
 
     res.json({
       profile: {
@@ -745,7 +780,7 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
   });
 
   // PATCH /api/auth/profile
-  router.patch('/auth/profile', requireAuth, (req: AuthenticatedRequest, res: Response) => {
+  router.patch('/auth/profile', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
     const profileValidation = validateProfileUpdateInput(req.body ?? {});
     if (!profileValidation.valid || !profileValidation.value) {
       res.status(400).json({ error: profileValidation.firstError, fieldErrors: profileValidation.errors });
@@ -756,21 +791,24 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
 
     const userId = req.auth!.userId;
     const role = req.auth!.role;
+    const nowIso = new Date().toISOString();
 
-    withTransaction(db, () => {
-      db.prepare(`UPDATE users SET full_name = ?, updated_at = datetime('now') WHERE id = ?`).run(cleanName, userId);
+    await withTransaction(db, async (tx) => {
+      await tx.execute('UPDATE users SET full_name = ?, updated_at = ? WHERE id = ?', [cleanName, nowIso, userId]);
 
       if (role === 'advertiser') {
         if (cleanOrg) {
-          db.prepare(
-            `UPDATE advertiser_accounts SET company_name = ?, country = ?, billing_email = COALESCE(NULLIF(?, ''), billing_email) WHERE user_id = ?`
-          ).run(cleanOrg, cleanCountry, cleanBilling, userId);
+          await tx.execute(
+            `UPDATE advertiser_accounts SET company_name = ?, country = ?, billing_email = COALESCE(NULLIF(?, ''), billing_email) WHERE user_id = ?`,
+            [cleanOrg, cleanCountry, cleanBilling, userId]
+          );
         }
       } else if (role === 'publisher') {
         if (cleanOrg) {
-          db.prepare(
-            `UPDATE publisher_accounts SET organization_name = ?, country = ? WHERE user_id = ?`
-          ).run(cleanOrg, cleanCountry, userId);
+          await tx.execute(
+            `UPDATE publisher_accounts SET organization_name = ?, country = ? WHERE user_id = ?`,
+            [cleanOrg, cleanCountry, userId]
+          );
         }
       }
     });
@@ -782,7 +820,7 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
   });
 
   // PATCH /api/auth/settings
-  router.patch('/auth/settings', requireAuth, (req: AuthenticatedRequest, res: Response) => {
+  router.patch('/auth/settings', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
     const settingsValidation = validateSecuritySettingsInput(req.body ?? {});
     if (!settingsValidation.valid || !settingsValidation.value) {
       res.status(400).json({ error: settingsValidation.firstError, fieldErrors: settingsValidation.errors });
@@ -790,12 +828,14 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
     }
     const { twoFactorEnabled, sessionTimeoutMinutes: timeout, currentPassword, newPassword } = settingsValidation.value;
     const userId = req.auth!.userId;
+    const nowIso = new Date().toISOString();
 
     let refreshedToken: string | undefined;
     if (newPassword) {
-      const userRow = db.prepare('SELECT password_hash, email FROM users WHERE id = ?').get(userId) as
-        | { password_hash: string; email: string }
-        | undefined;
+      const userRow = await db.queryOne<{ password_hash: string; email: string }>(
+        'SELECT password_hash, email FROM users WHERE id = ?',
+        [userId]
+      );
       if (!userRow || !currentPassword || !verifyPassword(currentPassword, userRow.password_hash)) {
         res.status(400).json({
           error: 'Current password is incorrect',
@@ -804,11 +844,12 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
         return;
       }
       const invalidatedAt = Date.now() + 1;
-      db.prepare(
-        `UPDATE users SET password_hash = ?, token_valid_after = ?, updated_at = datetime('now') WHERE id = ?`
-      ).run(hashPassword(newPassword), invalidatedAt, userId);
+      await db.execute(
+        'UPDATE users SET password_hash = ?, token_valid_after = ?, updated_at = ? WHERE id = ?',
+        [hashPassword(newPassword), invalidatedAt, nowIso, userId]
+      );
       if (req.rawToken && req.auth) {
-        revokeSessionToken(db, req.rawToken, req.auth.exp);
+        await revokeSessionToken(db, req.rawToken, req.auth.exp);
       }
       refreshedToken = signSessionToken(
         { userId, email: userRow.email, role: req.auth!.role },
@@ -816,18 +857,19 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
       );
     }
 
-    getOrCreatePrefs(userId);
-    db.prepare(
+    await getOrCreatePrefs(userId);
+    await db.execute(
       `UPDATE user_preferences
-       SET two_factor_enabled = ?, session_timeout_minutes = ?, updated_at = datetime('now')
-       WHERE user_id = ?`
-    ).run(twoFactorEnabled ? 1 : 0, Math.round(timeout), userId);
+       SET two_factor_enabled = ?, session_timeout_minutes = ?, updated_at = ?
+       WHERE user_id = ?`,
+      [twoFactorEnabled ? 1 : 0, Math.round(timeout), nowIso, userId]
+    );
 
     res.json({ updated: true, passwordChanged: Boolean(newPassword), token: refreshedToken });
   });
 
   // PATCH /api/auth/preferences
-  router.patch('/auth/preferences', requireAuth, (req: AuthenticatedRequest, res: Response) => {
+  router.patch('/auth/preferences', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
     const prefsValidation = validatePreferencesInput(req.body ?? {});
     if (!prefsValidation.valid || !prefsValidation.value) {
       res.status(400).json({ error: prefsValidation.firstError, fieldErrors: prefsValidation.errors });
@@ -836,27 +878,30 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
     const { timezone: cleanTz, preferredCurrency: cleanCurr, compactDensity, emailAlerts, fraudAlerts, weeklyDigest } =
       prefsValidation.value;
     const userId = req.auth!.userId;
+    const nowIso = new Date().toISOString();
 
-    getOrCreatePrefs(userId);
-    db.prepare(
+    await getOrCreatePrefs(userId);
+    await db.execute(
       `UPDATE user_preferences
-       SET timezone = ?, preferred_currency = ?, compact_density = ?, email_alerts = ?, fraud_alerts = ?, weekly_digest = ?, updated_at = datetime('now')
-       WHERE user_id = ?`
-    ).run(
-      cleanTz,
-      cleanCurr,
-      compactDensity ? 1 : 0,
-      emailAlerts ? 1 : 0,
-      fraudAlerts ? 1 : 0,
-      weeklyDigest ? 1 : 0,
-      userId
+       SET timezone = ?, preferred_currency = ?, compact_density = ?, email_alerts = ?, fraud_alerts = ?, weekly_digest = ?, updated_at = ?
+       WHERE user_id = ?`,
+      [
+        cleanTz,
+        cleanCurr,
+        compactDensity ? 1 : 0,
+        emailAlerts ? 1 : 0,
+        fraudAlerts ? 1 : 0,
+        weeklyDigest ? 1 : 0,
+        nowIso,
+        userId,
+      ]
     );
 
     res.json({ updated: true });
   });
 
   // POST /api/webhooks/payments/:provider (Cryptographically verified + idempotent payment webhook)
-  router.post('/webhooks/payments/:provider', (req: Request, res: Response) => {
+  router.post('/webhooks/payments/:provider', async (req: Request, res: Response) => {
     const provider = String(req.params.provider);
     if (!['paystack', 'flutterwave', 'stripe'].includes(provider)) {
       res.status(400).json({ error: 'Unsupported webhook provider' });
@@ -908,6 +953,20 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
     }
 
     const { eventId, advertiserId, amountUsd, eventType = 'charge.success' } = req.body ?? {};
+    const normalizedEventType = String(eventType || '').trim().toLowerCase();
+    const SETTLED_CREDIT_EVENTS = new Set(['charge.success', 'charge.completed', 'payment_intent.succeeded']);
+    if (!SETTLED_CREDIT_EVENTS.has(normalizedEventType)) {
+      recordWebhookMetric(true);
+      res.json({
+        processed: false,
+        ignored: true,
+        signatureVerified,
+        eventType: normalizedEventType,
+        reason: 'non_credit_event_type',
+      });
+      return;
+    }
+
     const cleanEventId = asTrimmedString(eventId);
     const cleanAdvertiserId = asTrimmedString(advertiserId);
     const amountCheck = validateNumberRange(amountUsd, { label: 'Webhook amount', min: 0.01, max: 1_000_000, currency: true });
@@ -921,47 +980,64 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
     const amountMicros = Math.round(amountCheck.value * 1_000_000);
 
     try {
-      const outcome = withTransaction(db, () => {
-        const dup = db
-          .prepare('SELECT id FROM payment_transactions WHERE provider_event_id = ?')
-          .get(String(eventId));
+      const outcome = await withTransaction(db, async (tx) => {
+        const dup = await tx.queryOne(
+          'SELECT id FROM payment_transactions WHERE provider_event_id = ?',
+          [String(eventId)]
+        );
         if (dup) {
           return { duplicate: true };
         }
 
-        const wallet = db
-          .prepare(
-            `SELECT w.id, w.available_micros, a.billing_email
-             FROM advertiser_wallets w
-             JOIN advertiser_accounts a ON a.id = w.advertiser_id
-             WHERE w.advertiser_id = ?`
-          )
-          .get(String(advertiserId)) as { id: string; available_micros: number; billing_email: string } | undefined;
+        const wallet = await tx.queryOne<{ id: string; billing_email: string }>(
+          `SELECT w.id, a.billing_email
+           FROM advertiser_wallets w
+           JOIN advertiser_accounts a ON a.id = w.advertiser_id
+           WHERE w.advertiser_id = ?`,
+          [String(advertiserId)]
+        );
         if (!wallet) {
           return { notFound: true };
         }
 
-        db.prepare(
+        await tx.execute(
           `INSERT INTO payment_transactions (id, provider, provider_event_id, transaction_type, amount_micros, currency, status, raw_payload_json)
-           VALUES (?, ?, ?, ?, ?, 'USD', 'verified', ?)`
-        ).run(`ptx_${crypto.randomUUID().slice(0, 10)}`, provider, String(eventId), String(eventType), amountMicros, JSON.stringify(req.body));
+           VALUES (?, ?, ?, ?, ?, 'USD', 'verified', ?)`,
+          [
+            `ptx_${crypto.randomUUID().slice(0, 10)}`,
+            provider,
+            String(eventId),
+            normalizedEventType,
+            amountMicros,
+            JSON.stringify(req.body),
+          ]
+        );
 
-        const newBal = wallet.available_micros + amountMicros;
-        db.prepare(
-          `UPDATE advertiser_wallets SET available_micros = ?, lifetime_deposited_micros = lifetime_deposited_micros + ? WHERE id = ?`
-        ).run(newBal, amountMicros, wallet.id);
+        await tx.execute(
+          `UPDATE advertiser_wallets
+           SET available_micros = available_micros + ?, lifetime_deposited_micros = lifetime_deposited_micros + ?, updated_at = ?
+           WHERE id = ?`,
+          [amountMicros, amountMicros, new Date().toISOString(), wallet.id]
+        );
 
-        db.prepare(
+        const updatedWallet = (await tx.queryOne<{ available_micros: number }>(
+          'SELECT available_micros FROM advertiser_wallets WHERE id = ?',
+          [wallet.id]
+        ))!;
+        const newBal = Number(updatedWallet.available_micros);
+
+        await tx.execute(
           `INSERT INTO financial_ledger (id, idempotency_key, account_type, account_id, entry_type, direction, amount_micros, balance_after_micros, currency, reference_type, reference_id, description)
-           VALUES (?, ?, 'advertiser_wallet', ?, 'deposit', 'credit', ?, ?, 'USD', 'webhook', ?, ?)`
-        ).run(
-          `led_${crypto.randomUUID().slice(0, 12)}`,
-          `wh_${provider}_${eventId}`,
-          wallet.id,
-          amountMicros,
-          newBal,
-          String(eventId),
-          `Verified ${provider} webhook credit`
+           VALUES (?, ?, 'advertiser_wallet', ?, 'deposit', 'credit', ?, ?, 'USD', 'webhook', ?, ?)`,
+          [
+            `led_${crypto.randomUUID().slice(0, 12)}`,
+            `wh_${provider}_${eventId}`,
+            wallet.id,
+            amountMicros,
+            newBal,
+            String(eventId),
+            `Verified ${provider} webhook credit`,
+          ]
         );
 
         return { duplicate: false, balanceAfterMicros: newBal, billingEmail: wallet.billing_email };
@@ -973,7 +1049,7 @@ export function createPublicAndAuthRouter(db: DatabaseSync): Router {
       }
 
       if ('billingEmail' in outcome && outcome.billingEmail && !outcome.duplicate) {
-        queueTransactionalEmail(db, {
+        await queueTransactionalEmail(db, {
           to: outcome.billingEmail,
           subject: `Looma Advertising — Prepaid Wallet Credited ($${Number(amountUsd).toFixed(2)})`,
           bodyText: `Your prepaid wallet was credited $${Number(amountUsd).toFixed(2)} via ${provider} webhook (${eventId}).`,

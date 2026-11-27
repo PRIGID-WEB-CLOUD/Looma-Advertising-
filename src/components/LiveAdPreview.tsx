@@ -11,6 +11,7 @@ export interface LiveAdPreviewProps {
   mediaUrl: string;
   destinationUrl: string;
   ctaText: string;
+  showCompatibilitySummary?: boolean;
 }
 
 function formatHost(url: string): string {
@@ -19,6 +20,23 @@ function formatHost(url: string): string {
   } catch {
     return url || 'yourbrand.com';
   }
+}
+
+function sanitizePreviewMediaUrl(raw: string): string {
+  const trimmed = (raw || '').trim();
+  if (!trimmed) return '';
+  if (trimmed.startsWith('/api/media/') || trimmed.startsWith('/src/assets/')) {
+    return trimmed;
+  }
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol === 'https:' || parsed.protocol === 'http:') {
+      return parsed.toString();
+    }
+  } catch {
+    return '';
+  }
+  return '';
 }
 
 export const LiveAdPreview: React.FC<LiveAdPreviewProps> = ({
@@ -30,14 +48,16 @@ export const LiveAdPreview: React.FC<LiveAdPreviewProps> = ({
   mediaUrl,
   destinationUrl,
   ctaText,
+  showCompatibilitySummary = true,
 }) => {
   const spec = getAdFormatSpec(format);
   const headline = title.trim() || spec.titlePlaceholder;
   const copy = description.trim() || spec.descriptionPlaceholder;
   const cta = ctaText.trim() || spec.defaultCta;
   const host = formatHost(destinationUrl);
-  const hasImage = Boolean(mediaUrl) && !isVideoMediaUrl(mediaUrl);
-  const hasVideo = Boolean(mediaUrl) && isVideoMediaUrl(mediaUrl);
+  const safeMediaUrl = sanitizePreviewMediaUrl(mediaUrl);
+  const hasImage = Boolean(safeMediaUrl) && !isVideoMediaUrl(safeMediaUrl);
+  const hasVideo = Boolean(safeMediaUrl) && isVideoMediaUrl(safeMediaUrl);
 
   return (
     <div className="space-y-4" data-testid="live-ad-preview" data-format={spec.format} data-dimensions={dimensions}>
@@ -88,7 +108,7 @@ export const LiveAdPreview: React.FC<LiveAdPreviewProps> = ({
             <div className="max-w-[320px] mx-auto h-[58px] rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 overflow-hidden flex items-center gap-2.5 pr-2">
               {hasImage && (
                 <img
-                  src={mediaUrl}
+                  src={safeMediaUrl}
                   alt={headline}
                   referrerPolicy="no-referrer"
                   className="w-14 h-full object-cover shrink-0"
@@ -107,7 +127,7 @@ export const LiveAdPreview: React.FC<LiveAdPreviewProps> = ({
               {hasImage && (
                 <div className="h-36 bg-slate-200 dark:bg-slate-800 relative">
                   <img
-                    src={mediaUrl}
+                    src={safeMediaUrl}
                     alt={headline}
                     referrerPolicy="no-referrer"
                     className="w-full h-full object-cover"
@@ -137,7 +157,7 @@ export const LiveAdPreview: React.FC<LiveAdPreviewProps> = ({
               {hasImage && (
                 <div className="aspect-[16/9] bg-slate-200 dark:bg-slate-800 relative">
                   <img
-                    src={mediaUrl}
+                    src={safeMediaUrl}
                     alt={headline}
                     referrerPolicy="no-referrer"
                     className="w-full h-full object-cover"
@@ -168,7 +188,7 @@ export const LiveAdPreview: React.FC<LiveAdPreviewProps> = ({
               {hasImage && (
                 <div className="w-28 h-[84px] bg-slate-200 dark:bg-slate-800 shrink-0 relative">
                   <img
-                    src={mediaUrl}
+                    src={safeMediaUrl}
                     alt={headline}
                     referrerPolicy="no-referrer"
                     className="w-full h-full object-cover"
@@ -207,7 +227,7 @@ export const LiveAdPreview: React.FC<LiveAdPreviewProps> = ({
         >
           {hasImage ? (
             <img
-              src={mediaUrl}
+              src={safeMediaUrl}
               alt={headline}
               referrerPolicy="no-referrer"
               className="w-full h-full object-cover"
@@ -246,21 +266,31 @@ export const LiveAdPreview: React.FC<LiveAdPreviewProps> = ({
           >
             {hasVideo ? (
               <video
-                src={mediaUrl}
+                src={safeMediaUrl}
                 controls
                 muted
                 className="w-full h-full object-cover"
               />
             ) : (
-              <div className="w-full h-full flex flex-col items-center justify-center p-4 text-center bg-gradient-to-br from-slate-900 via-slate-800 to-slate-950">
-                <div className="w-12 h-12 rounded-full bg-white/15 border border-white/25 flex items-center justify-center mb-2">
-                  <Play className="w-5 h-5 text-white fill-white ml-0.5" />
-                </div>
-                <div className="text-xs font-medium text-slate-200">
-                  Video Stream Stage ({dimensions || '16:9'})
-                </div>
-                <div className="text-[11px] text-slate-400 mt-0.5">
-                  Upload MP4/WEBM or enter a video URL to preview playback
+              <div className="relative w-full h-full flex flex-col items-center justify-center p-4 text-center bg-gradient-to-br from-slate-900 via-slate-800 to-slate-950 overflow-hidden">
+                {hasImage && (
+                  <img
+                    src={safeMediaUrl}
+                    alt={headline}
+                    referrerPolicy="no-referrer"
+                    className="absolute inset-0 w-full h-full object-cover opacity-40"
+                  />
+                )}
+                <div className="relative z-10 flex flex-col items-center">
+                  <div className="w-12 h-12 rounded-full bg-white/20 border border-white/35 flex items-center justify-center mb-2 backdrop-blur-xs">
+                    <Play className="w-5 h-5 text-white fill-white ml-0.5" />
+                  </div>
+                  <div className="text-xs font-medium text-white drop-shadow-xs">
+                    Video Stream Stage ({dimensions || '16:9'})
+                  </div>
+                  <div className="text-[11px] text-slate-200 mt-0.5 drop-shadow-xs">
+                    {hasImage ? 'Poster frame loaded · MP4/WEBM playback ready' : 'Upload MP4/WEBM or enter a video URL to preview playback'}
+                  </div>
                 </div>
               </div>
             )}
@@ -300,7 +330,7 @@ export const LiveAdPreview: React.FC<LiveAdPreviewProps> = ({
             <div className="flex items-center gap-3 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-md overflow-hidden pr-3">
               {hasImage && (
                 <img
-                  src={mediaUrl}
+                  src={safeMediaUrl}
                   alt={headline}
                   referrerPolicy="no-referrer"
                   className="w-24 h-20 object-cover shrink-0"
@@ -324,7 +354,7 @@ export const LiveAdPreview: React.FC<LiveAdPreviewProps> = ({
             <div className="max-w-[260px] mx-auto bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-md overflow-hidden">
               {hasImage && (
                 <img
-                  src={mediaUrl}
+                  src={safeMediaUrl}
                   alt={headline}
                   referrerPolicy="no-referrer"
                   className="w-full h-28 object-cover"
@@ -357,7 +387,7 @@ export const LiveAdPreview: React.FC<LiveAdPreviewProps> = ({
           {hasImage && (
             <div className="aspect-[1200/628] bg-slate-200 dark:bg-slate-800">
               <img
-                src={mediaUrl}
+                src={safeMediaUrl}
                 alt={headline}
                 referrerPolicy="no-referrer"
                 className="w-full h-full object-cover"
@@ -390,7 +420,7 @@ export const LiveAdPreview: React.FC<LiveAdPreviewProps> = ({
           {hasImage && (
             <div className="aspect-[16/10] bg-slate-200 dark:bg-slate-800">
               <img
-                src={mediaUrl}
+                src={safeMediaUrl}
                 alt={headline}
                 referrerPolicy="no-referrer"
                 className="w-full h-full object-cover"
@@ -416,32 +446,34 @@ export const LiveAdPreview: React.FC<LiveAdPreviewProps> = ({
       )}
 
       {/* Placement compatibility summary */}
-      <div className="rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/60 p-3 text-xs space-y-1.5">
-        <div className="flex items-start justify-between gap-3">
-          <span className="text-slate-500 dark:text-slate-400 shrink-0">Eligible Placements</span>
-          <span className="font-mono text-[11px] text-slate-800 dark:text-slate-200 text-right">
-            {spec.compatiblePlacements.join(', ')}
-          </span>
+      {showCompatibilitySummary && (
+        <div className="rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/60 p-3 text-xs space-y-1.5">
+          <div className="flex items-start justify-between gap-3">
+            <span className="text-slate-500 dark:text-slate-400 shrink-0">Eligible Placements</span>
+            <span className="font-mono text-[11px] text-slate-800 dark:text-slate-200 text-right">
+              {spec.compatiblePlacements.join(', ')}
+            </span>
+          </div>
+          <div className="flex items-start justify-between gap-3">
+            <span className="text-slate-500 dark:text-slate-400 shrink-0">Media Requirement</span>
+            <span className="font-medium text-slate-800 dark:text-slate-200 text-right">
+              {spec.mediaMode === 'none'
+                ? 'No Media (Text-Only)'
+                : spec.mediaMode === 'video'
+                ? 'Video File / URL (MP4, WEBM)'
+                : spec.mediaRequired
+                ? 'Image Required'
+                : 'Image Recommended (Optional)'}
+            </span>
+          </div>
+          <div className="flex items-start justify-between gap-3">
+            <span className="text-slate-500 dark:text-slate-400 shrink-0">Recommended Billing</span>
+            <span className="font-mono text-[11px] text-slate-800 dark:text-slate-200 text-right">
+              {spec.recommendedPricingModels.join(' · ')}
+            </span>
+          </div>
         </div>
-        <div className="flex items-start justify-between gap-3">
-          <span className="text-slate-500 dark:text-slate-400 shrink-0">Media Requirement</span>
-          <span className="font-medium text-slate-800 dark:text-slate-200 text-right">
-            {spec.mediaMode === 'none'
-              ? 'No Media (Text-Only)'
-              : spec.mediaMode === 'video'
-              ? 'Video File / URL (MP4, WEBM)'
-              : spec.mediaRequired
-              ? 'Image Required'
-              : 'Image Recommended (Optional)'}
-          </span>
-        </div>
-        <div className="flex items-start justify-between gap-3">
-          <span className="text-slate-500 dark:text-slate-400 shrink-0">Recommended Billing</span>
-          <span className="font-mono text-[11px] text-slate-800 dark:text-slate-200 text-right">
-            {spec.recommendedPricingModels.join(' · ')}
-          </span>
-        </div>
-      </div>
+      )}
     </div>
   );
 };

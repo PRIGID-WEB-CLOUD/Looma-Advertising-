@@ -1,4 +1,4 @@
-import type { DatabaseSync } from 'node:sqlite';
+import type { DbClient } from '../db/postgres';
 
 export interface PlatformFeatureFlags {
   /** Looma is the exclusive active first-party publisher at initial launch. */
@@ -30,24 +30,25 @@ export const FEATURE_FLAG_KEYS: FeatureFlagKey[] = Object.keys(
   INITIAL_LAUNCH_FEATURE_FLAGS
 ) as FeatureFlagKey[];
 
-export function seedFeatureFlagsIfMissing(db: DatabaseSync): void {
-  const stmt = db.prepare(
-    `INSERT OR IGNORE INTO platform_settings (key, value_json, updated_at)
-     VALUES (?, ?, datetime('now'))`
-  );
+export async function seedFeatureFlagsIfMissing(db: DbClient): Promise<void> {
+  const nowIso = new Date().toISOString();
   for (const key of FEATURE_FLAG_KEYS) {
-    stmt.run(key, JSON.stringify(INITIAL_LAUNCH_FEATURE_FLAGS[key]));
+    await db.execute(
+      `INSERT INTO platform_settings (key, value_json, updated_at)
+       VALUES (?, ?, ?)
+       ON CONFLICT (key) DO NOTHING`,
+      [key, JSON.stringify(INITIAL_LAUNCH_FEATURE_FLAGS[key]), nowIso]
+    );
   }
 }
 
-export function getFeatureFlags(db: DatabaseSync): PlatformFeatureFlags {
+export async function getFeatureFlags(db: DbClient): Promise<PlatformFeatureFlags> {
   const result: PlatformFeatureFlags = { ...INITIAL_LAUNCH_FEATURE_FLAGS };
-  const rows = db
-    .prepare(
-      `SELECT key, value_json FROM platform_settings
-       WHERE key IN (${FEATURE_FLAG_KEYS.map(() => '?').join(', ')})`
-    )
-    .all(...FEATURE_FLAG_KEYS) as Array<{ key: string; value_json: string }>;
+  const rows = await db.query<{ key: string; value_json: string }>(
+    `SELECT key, value_json FROM platform_settings
+     WHERE key IN (${FEATURE_FLAG_KEYS.map(() => '?').join(', ')})`,
+    FEATURE_FLAG_KEYS
+  );
 
   for (const row of rows) {
     const key = row.key as FeatureFlagKey;
@@ -62,15 +63,15 @@ export function getFeatureFlags(db: DatabaseSync): PlatformFeatureFlags {
   return result;
 }
 
-export function isPublisherEligibleForDelivery(
-  db: DatabaseSync,
+export async function isPublisherEligibleForDelivery(
+  db: DbClient,
   publisherType: string,
   approvalStatus: string
-): { eligible: boolean; reason?: string } {
+): Promise<{ eligible: boolean; reason?: string }> {
   if (approvalStatus !== 'approved') {
     return { eligible: false, reason: 'publisher_not_approved' };
   }
-  const flags = getFeatureFlags(db);
+  const flags = await getFeatureFlags(db);
   if (publisherType === 'third_party' && flags.looma_first_party_only_mode && !flags.third_party_sdk_distribution_enabled) {
     return {
       eligible: false,

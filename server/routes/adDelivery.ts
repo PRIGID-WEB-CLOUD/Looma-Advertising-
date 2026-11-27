@@ -1,8 +1,7 @@
 import crypto from 'node:crypto';
-import { Router, type Request, type Response } from 'express';
-import type { DatabaseSync } from 'node:sqlite';
-import { hashIp, TRACKING_SECRET } from '../auth';
-import { withTransaction } from '../db';
+import { createAppRouter, type AppRouter, type Request, type Response } from '../http/router';
+import { authenticateBearerToken, getTrackingSecret, hashIp, timingSafeSecretMatch } from '../auth';
+import { withTransaction, type DbClient } from '../db/postgres';
 import {
   CandidateCampaign,
   computeSingleEventBillMicros,
@@ -20,6 +19,7 @@ import {
   captureReservationInTx,
   releaseReservationInTx,
   reserveBudgetForRequest,
+  type ReserveBudgetResult,
 } from '../modules/budgetReservations';
 import { getFeatureFlags, isPublisherEligibleForDelivery } from '../modules/featureFlags';
 import { recordAdDeliveryMetric, recordFraudBlockedMetric } from '../modules/monitoring';
@@ -39,8 +39,8 @@ function parseJsonArray(raw: string, fallback: string[]): string[] {
   }
 }
 
-function settlePublisherRevenueInTx(
-  db: DatabaseSync,
+async function settlePublisherRevenueInTx(
+  tx: DbClient,
   params: {
     publisherId: string;
     actualBilled: number;
@@ -49,66 +49,98 @@ function settlePublisherRevenueInTx(
     ledgerIdempotencyKey: string;
     description: string;
   }
-): { publisherShareMicros: number; platformFeeMicros: number } {
+): Promise<{ publisherShareMicros: number; platformFeeMicros: number }> {
   if (params.actualBilled <= 0) {
     return { publisherShareMicros: 0, platformFeeMicros: 0 };
   }
 
-  const pubRow = db
-    .prepare('SELECT publisher_type, custom_revenue_share_bps FROM publisher_accounts WHERE id = ?')
-    .get(params.publisherId) as { publisher_type: string | null; custom_revenue_share_bps: number | null } | undefined;
+  const pubRow = await tx.queryOne<{ publisher_type: string | null; custom_revenue_share_bps: number | null }>(
+    'SELECT publisher_type, custom_revenue_share_bps FROM publisher_accounts WHERE id = ?',
+    [params.publisherId]
+  );
 
-  const flags = getFeatureFlags(db);
+  const flags = await getFeatureFlags(tx);
   if (pubRow?.publisher_type === 'third_party' && !flags.third_party_revenue_allocation_enabled) {
     return { publisherShareMicros: 0, platformFeeMicros: params.actualBilled };
   }
 
-  const settingRow = db
-    .prepare("SELECT value_json FROM platform_settings WHERE key = 'default_publisher_share_bps'")
-    .get() as { value_json: string } | undefined;
-  const defaultBps = settingRow ? Number(JSON.parse(settingRow.value_json)) : 7000;
+  const settingRow = await tx.queryOne<{ value_json: string }>(
+    "SELECT value_json FROM platform_settings WHERE key = 'default_publisher_share_bps'"
+  );
+  let defaultBps = 7000;
+  if (settingRow?.value_json) {
+    try {
+      const parsed = Number(JSON.parse(settingRow.value_json));
+      if (Number.isFinite(parsed)) defaultBps = parsed;
+    } catch {
+      defaultBps = 7000;
+    }
+  }
   const shareBps = pubRow?.custom_revenue_share_bps ?? defaultBps;
 
   const { publisherShareMicros, platformFeeMicros } = splitRevenueMicros(params.actualBilled, shareBps);
 
-  const pubWal = db
-    .prepare('SELECT id, available_micros FROM publisher_wallets WHERE publisher_id = ?')
-    .get(params.publisherId) as { id: string; available_micros: number } | undefined;
+  const pubWal = await tx.queryOne<{ id: string }>(
+    'SELECT id FROM publisher_wallets WHERE publisher_id = ?',
+    [params.publisherId]
+  );
 
   if (pubWal && publisherShareMicros > 0) {
-    const newPubBal = pubWal.available_micros + publisherShareMicros;
-    db.prepare(
+    await tx.execute(
       `UPDATE publisher_wallets
-       SET estimated_micros = estimated_micros + ?, available_micros = ?, lifetime_earned_micros = lifetime_earned_micros + ?, updated_at = datetime('now')
-       WHERE id = ?`
-    ).run(publisherShareMicros, newPubBal, publisherShareMicros, pubWal.id);
+       SET estimated_micros = estimated_micros + ?, available_micros = available_micros + ?, lifetime_earned_micros = lifetime_earned_micros + ?, updated_at = ?
+       WHERE id = ?`,
+      [publisherShareMicros, publisherShareMicros, publisherShareMicros, new Date().toISOString(), pubWal.id]
+    );
 
-    db.prepare(
+    const updatedPubWal = (await tx.queryOne<{ available_micros: number }>(
+      'SELECT available_micros FROM publisher_wallets WHERE id = ?',
+      [pubWal.id]
+    ))!;
+    const newPubBal = Number(updatedPubWal.available_micros);
+
+    await tx.execute(
       `INSERT INTO financial_ledger (id, idempotency_key, account_type, account_id, entry_type, direction, amount_micros, balance_after_micros, currency, reference_type, reference_id, description)
-       VALUES (?, ?, 'publisher_wallet', ?, 'publisher_earning', 'credit', ?, ?, 'USD', ?, ?, ?)`
-    ).run(
-      `led_${crypto.randomUUID().slice(0, 12)}`,
-      params.ledgerIdempotencyKey,
-      pubWal.id,
-      publisherShareMicros,
-      newPubBal,
-      params.referenceType,
-      params.referenceId,
-      params.description
+       VALUES (?, ?, 'publisher_wallet', ?, 'publisher_earning', 'credit', ?, ?, 'USD', ?, ?, ?)`,
+      [
+        `led_${crypto.randomUUID().slice(0, 12)}`,
+        params.ledgerIdempotencyKey,
+        pubWal.id,
+        publisherShareMicros,
+        newPubBal,
+        params.referenceType,
+        params.referenceId,
+        params.description,
+      ]
     );
   }
 
   return { publisherShareMicros, platformFeeMicros };
 }
 
-export function createAdDeliveryRouter(db: DatabaseSync): Router {
-  const router = Router();
+export interface AdEventQueueMessage {
+  eventType: string;
+  entityType: string;
+  entityId: string;
+  payload: Record<string, unknown>;
+}
+
+export function createAdDeliveryRouter(
+  db: DbClient,
+  options?: { onEvent?: (msg: AdEventQueueMessage) => void | Promise<void> }
+): AppRouter {
+  const router = createAppRouter();
+  const emitEvent = (msg: AdEventQueueMessage) => {
+    if (options?.onEvent) {
+      Promise.resolve(options.onEvent(msg)).catch(() => {});
+    }
+  };
 
   // POST /api/v1/ad/request
-  router.post('/request', (req: Request, res: Response) => {
+  router.post('/request', async (req: Request, res: Response) => {
     const startedAt = performance.now();
-    const clientIp = (req.ip || req.socket.remoteAddress || '127.0.0.1').toString();
-    if (!checkPersistentRateLimit(db, `adreq:${clientIp}`, 240)) {
+    const clientIp = (req.ip || req.socket?.remoteAddress || '127.0.0.1').toString();
+    if (!(await checkPersistentRateLimit(db, `adreq:${clientIp}`, 240))) {
       res.status(429).json({ error: 'Rate limit exceeded for ad requests' });
       return;
     }
@@ -144,38 +176,35 @@ export function createAdDeliveryRouter(db: DatabaseSync): Router {
       return;
     }
 
-    const placement = db
-      .prepare(
-        `SELECT p.id, p.property_id, p.publisher_id, p.format, p.dimensions, p.floor_cpm_micros, p.status,
-                prop.approval_status AS property_approval, prop.verification_status AS property_verification,
-                pub.approval_status AS publisher_approval, pub.publisher_type
-         FROM ad_placements p
-         JOIN publisher_properties prop ON prop.id = p.property_id
-         JOIN publisher_accounts pub ON pub.id = p.publisher_id
-         WHERE p.id = ?`
-      )
-      .get(placementId) as
-      | {
-          id: string;
-          property_id: string;
-          publisher_id: string;
-          format: PlacementFormat;
-          dimensions: string;
-          floor_cpm_micros: number;
-          status: string;
-          property_approval: string;
-          property_verification: string;
-          publisher_approval: string;
-          publisher_type: string | null;
-        }
-      | undefined;
+    const placement = await db.queryOne<{
+      id: string;
+      property_id: string;
+      publisher_id: string;
+      format: PlacementFormat;
+      dimensions: string;
+      floor_cpm_micros: number;
+      status: string;
+      property_approval: string;
+      property_verification: string;
+      publisher_approval: string;
+      publisher_type: string | null;
+    }>(
+      `SELECT p.id, p.property_id, p.publisher_id, p.format, p.dimensions, p.floor_cpm_micros, p.status,
+              prop.approval_status AS property_approval, prop.verification_status AS property_verification,
+              pub.approval_status AS publisher_approval, pub.publisher_type
+       FROM ad_placements p
+       JOIN publisher_properties prop ON prop.id = p.property_id
+       JOIN publisher_accounts pub ON pub.id = p.publisher_id
+       WHERE p.id = ?`,
+      [cleanPlacementId]
+    );
 
     if (!placement) {
       res.status(404).json({ error: 'Ad placement not found' });
       return;
     }
 
-    const pubEligibility = isPublisherEligibleForDelivery(
+    const pubEligibility = await isPublisherEligibleForDelivery(
       db,
       placement.publisher_type || 'first_party',
       placement.publisher_approval
@@ -201,45 +230,22 @@ export function createAdDeliveryRouter(db: DatabaseSync): Router {
       typeof sessionId === 'string' && sessionId.length > 0 ? sessionId : `${clientIp}:${req.headers['user-agent'] || ''}`
     );
 
+    const twoHoursAgoIso = new Date(Date.now() - 2 * 60 * 60_000).toISOString();
     // Count session impressions per campaign in last 2 hours for frequency capping
-    const freqRows = db
-      .prepare(
-        `SELECT campaign_id, COUNT(*) AS cnt
-         FROM impressions
-         WHERE session_hash = ? AND created_at >= datetime('now', '-2 hours')
-         GROUP BY campaign_id`
-      )
-      .all(sessionHash) as Array<{ campaign_id: string; cnt: number }>;
+    const freqRows = await db.query<{ campaign_id: string; cnt: number }>(
+      `SELECT campaign_id, COUNT(*) AS cnt
+       FROM impressions
+       WHERE session_hash = ? AND created_at >= ?
+       GROUP BY campaign_id`,
+      [sessionHash, twoHoursAgoIso]
+    );
     const sessionImpressionCounts: Record<string, number> = {};
     for (const row of freqRows) {
-      sessionImpressionCounts[row.campaign_id] = row.cnt;
+      sessionImpressionCounts[row.campaign_id] = Number(row.cnt);
     }
 
     // Load active candidate campaigns joined with targeting, budgets, creatives, and wallet balance
-    const rows = db
-      .prepare(
-        `SELECT c.id AS campaign_id, c.advertiser_id, c.name AS campaign_name, c.pricing_model,
-                c.bidding_strategy, c.status, c.moderation_status, c.start_date, c.end_date,
-                c.frequency_cap_per_session,
-                b.daily_budget_micros, b.total_budget_micros, b.spent_today_micros, b.spent_total_micros,
-                b.max_bid_micros, b.pacing_mode,
-                w.available_micros AS wallet_available_micros,
-                t.countries_json, t.languages_json, t.device_categories_json, t.operating_systems_json,
-                t.browsers_json, t.contextual_categories_json, t.consent_required,
-                adv.format AS creative_format, crt.id AS creative_id, crt.advertisement_id,
-                crt.title, crt.description, crt.media_url, crt.destination_url, crt.cta_text,
-                crt.tracking_params, crt.dimensions, crt.approval_status AS creative_approval_status,
-                adv_acc.account_status AS advertiser_status
-         FROM campaigns c
-         JOIN advertiser_accounts adv_acc ON adv_acc.id = c.advertiser_id
-         JOIN advertiser_wallets w ON w.advertiser_id = c.advertiser_id
-         JOIN campaign_budgets b ON b.campaign_id = c.id
-         JOIN campaign_targeting t ON t.campaign_id = c.id
-         JOIN advertisements adv ON adv.campaign_id = c.id AND adv.status = 'active'
-         JOIN ad_creatives crt ON crt.advertisement_id = adv.id
-         WHERE c.status = 'active' AND c.moderation_status = 'approved' AND adv_acc.account_status = 'active'`
-      )
-      .all() as Array<{
+    const rows = await db.query<{
       campaign_id: string;
       advertiser_id: string;
       campaign_name: string;
@@ -275,7 +281,28 @@ export function createAdDeliveryRouter(db: DatabaseSync): Router {
       tracking_params: string;
       dimensions: string;
       creative_approval_status: string;
-    }>;
+    }>(
+      `SELECT c.id AS campaign_id, c.advertiser_id, c.name AS campaign_name, c.pricing_model,
+              c.bidding_strategy, c.status, c.moderation_status, c.start_date, c.end_date,
+              c.frequency_cap_per_session,
+              b.daily_budget_micros, b.total_budget_micros, b.spent_today_micros, b.spent_total_micros,
+              b.max_bid_micros, b.pacing_mode,
+              w.available_micros AS wallet_available_micros,
+              t.countries_json, t.languages_json, t.device_categories_json, t.operating_systems_json,
+              t.browsers_json, t.contextual_categories_json, t.consent_required,
+              adv.format AS creative_format, crt.id AS creative_id, crt.advertisement_id,
+              crt.title, crt.description, crt.media_url, crt.destination_url, crt.cta_text,
+              crt.tracking_params, crt.dimensions, crt.approval_status AS creative_approval_status,
+              adv_acc.account_status AS advertiser_status
+       FROM campaigns c
+       JOIN advertiser_accounts adv_acc ON adv_acc.id = c.advertiser_id
+       JOIN advertiser_wallets w ON w.advertiser_id = c.advertiser_id
+       JOIN campaign_budgets b ON b.campaign_id = c.id
+       JOIN campaign_targeting t ON t.campaign_id = c.id
+       JOIN advertisements adv ON adv.campaign_id = c.id AND adv.status = 'active'
+       JOIN ad_creatives crt ON crt.advertisement_id = adv.id
+       WHERE c.status = 'active' AND c.moderation_status = 'approved' AND adv_acc.account_status = 'active'`
+    );
 
     const candidates: CandidateCampaign[] = rows.map((r) => ({
       campaignId: r.campaign_id,
@@ -287,14 +314,14 @@ export function createAdDeliveryRouter(db: DatabaseSync): Router {
       moderationStatus: r.moderation_status,
       startDate: r.start_date,
       endDate: r.end_date,
-      frequencyCapPerSession: r.frequency_cap_per_session,
-      dailyBudgetMicros: r.daily_budget_micros,
-      totalBudgetMicros: r.total_budget_micros,
-      spentTodayMicros: r.spent_today_micros,
-      spentTotalMicros: r.spent_total_micros,
-      maxBidMicros: r.max_bid_micros,
+      frequencyCapPerSession: Number(r.frequency_cap_per_session),
+      dailyBudgetMicros: Number(r.daily_budget_micros),
+      totalBudgetMicros: Number(r.total_budget_micros),
+      spentTodayMicros: Number(r.spent_today_micros),
+      spentTotalMicros: Number(r.spent_total_micros),
+      maxBidMicros: Number(r.max_bid_micros),
       pacingMode: r.pacing_mode,
-      walletAvailableMicros: r.wallet_available_micros,
+      walletAvailableMicros: Number(r.wallet_available_micros),
       targeting: {
         countries: parseJsonArray(r.countries_json, ['ALL']),
         languages: parseJsonArray(r.languages_json, ['ALL']),
@@ -322,23 +349,23 @@ export function createAdDeliveryRouter(db: DatabaseSync): Router {
       qualityScore: 1.0,
     }));
 
-    const recentRows = db
-      .prepare(
-        `SELECT campaign_id, COUNT(*) AS cnt
-         FROM impressions
-         WHERE created_at >= datetime('now', '-1 hour')
-         GROUP BY campaign_id`
-      )
-      .all() as Array<{ campaign_id: string; cnt: number }>;
+    const oneHourAgoIso = new Date(Date.now() - 60 * 60_000).toISOString();
+    const recentRows = await db.query<{ campaign_id: string; cnt: number }>(
+      `SELECT campaign_id, COUNT(*) AS cnt
+       FROM impressions
+       WHERE created_at >= ?
+       GROUP BY campaign_id`,
+      [oneHourAgoIso]
+    );
     const recentDeliveryCounts: Record<string, number> = {};
     for (const row of recentRows) {
-      recentDeliveryCounts[row.campaign_id] = row.cnt;
+      recentDeliveryCounts[row.campaign_id] = Number(row.cnt);
     }
 
     const winner = selectWinningAd(candidates, {
       placementId: placement.id,
       placementFormat: placement.format,
-      floorCpmMicros: placement.floor_cpm_micros,
+      floorCpmMicros: Number(placement.floor_cpm_micros),
       country: String(country),
       language: String(language),
       deviceCategory: String(deviceCategory),
@@ -353,9 +380,9 @@ export function createAdDeliveryRouter(db: DatabaseSync): Router {
 
     const requestId = `req_${crypto.randomUUID().slice(0, 12)}`;
 
-    let reservation: ReturnType<typeof reserveBudgetForRequest> | null = null;
+    let reservation: ReserveBudgetResult | null = null;
     if (winner) {
-      reservation = reserveBudgetForRequest(db, {
+      reservation = await reserveBudgetForRequest(db, {
         advertiserId: winner.candidate.advertiserId,
         campaignId: winner.candidate.campaignId,
         requestId,
@@ -366,26 +393,27 @@ export function createAdDeliveryRouter(db: DatabaseSync): Router {
 
     const actuallyFilled = Boolean(winner && reservation?.reserved);
 
-    db.prepare(
+    await db.execute(
       `INSERT INTO ad_requests (id, placement_id, property_id, publisher_id, winning_campaign_id, winning_creative_id, country, device_category, os, browser, language, category, consent_granted, filled, ip_hash, session_hash)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    ).run(
-      requestId,
-      placement.id,
-      placement.property_id,
-      placement.publisher_id,
-      actuallyFilled && winner ? winner.candidate.campaignId : null,
-      actuallyFilled && winner ? winner.candidate.creative.id : null,
-      String(country),
-      String(deviceCategory),
-      String(os),
-      String(browser),
-      String(language),
-      String(category),
-      consentGranted ? 1 : 0,
-      actuallyFilled ? 1 : 0,
-      ipHash,
-      sessionHash
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        requestId,
+        placement.id,
+        placement.property_id,
+        placement.publisher_id,
+        actuallyFilled && winner ? winner.candidate.campaignId : null,
+        actuallyFilled && winner ? winner.candidate.creative.id : null,
+        String(country),
+        String(deviceCategory),
+        String(os),
+        String(browser),
+        String(language),
+        String(category),
+        consentGranted ? 1 : 0,
+        actuallyFilled ? 1 : 0,
+        ipHash,
+        sessionHash,
+      ]
     );
 
     recordAdDeliveryMetric(actuallyFilled, performance.now() - startedAt, false);
@@ -413,11 +441,24 @@ export function createAdDeliveryRouter(db: DatabaseSync): Router {
       exp,
     };
 
-    const impressionToken = signTrackingToken({ ...baseToken, eventType: 'impression' }, TRACKING_SECRET);
-    const clickToken = signTrackingToken({ ...baseToken, eventType: 'click' }, TRACKING_SECRET);
-    const conversionToken = signTrackingToken({ ...baseToken, eventType: 'conversion' }, TRACKING_SECRET);
-    const videoToken = signTrackingToken({ ...baseToken, eventType: 'video' }, TRACKING_SECRET);
-    const installToken = signTrackingToken({ ...baseToken, eventType: 'install' }, TRACKING_SECRET);
+    const trackingSecret = getTrackingSecret();
+    const impressionToken = signTrackingToken({ ...baseToken, eventType: 'impression' }, trackingSecret);
+    const clickToken = signTrackingToken({ ...baseToken, eventType: 'click' }, trackingSecret);
+    const conversionToken = signTrackingToken({ ...baseToken, eventType: 'conversion' }, trackingSecret);
+    const videoToken = signTrackingToken({ ...baseToken, eventType: 'video' }, trackingSecret);
+    const installToken = signTrackingToken({ ...baseToken, eventType: 'install' }, trackingSecret);
+
+    emitEvent({
+      eventType: 'ad_request_filled',
+      entityType: 'ad_request',
+      entityId: requestId,
+      payload: {
+        campaignId: winner.candidate.campaignId,
+        creativeId: winner.candidate.creative.id,
+        placementId: placement.id,
+        publisherId: placement.publisher_id,
+      },
+    });
 
     const separator = winner.candidate.creative.destinationUrl.includes('?') ? '&' : '?';
     const fullDestinationUrl = winner.candidate.creative.trackingParams
@@ -460,21 +501,21 @@ export function createAdDeliveryRouter(db: DatabaseSync): Router {
   });
 
   // POST /api/v1/ad/impression
-  router.post('/impression', (req: Request, res: Response) => {
+  router.post('/impression', async (req: Request, res: Response) => {
     const { impressionToken, viewable = true, sessionId } = req.body ?? {};
     if (!impressionToken || typeof impressionToken !== 'string') {
       res.status(400).json({ error: 'impressionToken is required' });
       return;
     }
 
-    const verified = verifyTrackingToken(impressionToken, TRACKING_SECRET);
+    const verified = verifyTrackingToken(impressionToken, getTrackingSecret());
     if (!verified.valid || verified.payload.eventType !== 'impression') {
       res.status(400).json({ error: 'Invalid or expired impression token' });
       return;
     }
 
     const payload = verified.payload;
-    const clientIp = (req.ip || req.socket.remoteAddress || '127.0.0.1').toString();
+    const clientIp = (req.ip || req.socket?.remoteAddress || '127.0.0.1').toString();
     const ipHash = hashIp(clientIp);
     const sessionHash = hashIp(
       typeof sessionId === 'string' && sessionId.length > 0 ? sessionId : `${clientIp}:${req.headers['user-agent'] || ''}`
@@ -486,18 +527,20 @@ export function createAdDeliveryRouter(db: DatabaseSync): Router {
     }
 
     try {
-      const outcome = withTransaction(db, () => {
+      const outcome = await withTransaction(db, async (tx) => {
         // Deduplicate by request_id
-        const existing = db
-          .prepare('SELECT id FROM impressions WHERE request_id = ?')
-          .get(payload.requestId) as { id: string } | undefined;
+        const existing = await tx.queryOne<{ id: string }>(
+          'SELECT id FROM impressions WHERE request_id = ?',
+          [payload.requestId]
+        );
         if (existing) {
           return { duplicate: true, impressionId: existing.id, billedMicros: 0 };
         }
 
-        const reqRow = db
-          .prepare('SELECT country, device_category FROM ad_requests WHERE id = ?')
-          .get(payload.requestId) as { country: string; device_category: string } | undefined;
+        const reqRow = await tx.queryOne<{ country: string; device_category: string }>(
+          'SELECT country, device_category FROM ad_requests WHERE id = ?',
+          [payload.requestId]
+        );
 
         const grossBillMicros = computeSingleEventBillMicros(
           payload.pricingModel,
@@ -510,7 +553,7 @@ export function createAdDeliveryRouter(db: DatabaseSync): Router {
         let platformFeeMicros = 0;
 
         if (grossBillMicros > 0) {
-          const captured = captureReservationInTx(db, {
+          const captured = await captureReservationInTx(tx, {
             advertiserId: payload.advertiserId,
             campaignId: payload.campaignId,
             requestId: payload.requestId,
@@ -522,7 +565,7 @@ export function createAdDeliveryRouter(db: DatabaseSync): Router {
 
           if (captured) {
             actualBilled = captured.capturedMicros;
-            const split = settlePublisherRevenueInTx(db, {
+            const split = await settlePublisherRevenueInTx(tx, {
               publisherId: payload.publisherId,
               actualBilled,
               referenceType: 'impression',
@@ -536,34 +579,38 @@ export function createAdDeliveryRouter(db: DatabaseSync): Router {
         }
 
         const impressionId = `imp_${crypto.randomUUID().slice(0, 12)}`;
-        db.prepare(
+        await tx.execute(
           `INSERT INTO impressions (id, request_id, campaign_id, creative_id, placement_id, publisher_id, advertiser_id, viewable, is_valid, billed_micros, publisher_share_micros, platform_fee_micros, country, device_category, ip_hash, session_hash)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?, ?, ?, ?, ?, ?)`
-        ).run(
-          impressionId,
-          payload.requestId,
-          payload.campaignId,
-          payload.creativeId,
-          payload.placementId,
-          payload.publisherId,
-          payload.advertiserId,
-          actualBilled,
-          publisherShareMicros,
-          platformFeeMicros,
-          reqRow?.country || 'US',
-          reqRow?.device_category || 'desktop',
-          ipHash,
-          sessionHash
+           VALUES (?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            impressionId,
+            payload.requestId,
+            payload.campaignId,
+            payload.creativeId,
+            payload.placementId,
+            payload.publisherId,
+            payload.advertiserId,
+            actualBilled,
+            publisherShareMicros,
+            platformFeeMicros,
+            reqRow?.country || 'US',
+            reqRow?.device_category || 'desktop',
+            ipHash,
+            sessionHash,
+          ]
         );
 
-        db.prepare(
-          `UPDATE ad_placements SET integration_verified = 1 WHERE id = ?`
-        ).run(payload.placementId);
+        await tx.execute('UPDATE ad_placements SET integration_verified = 1 WHERE id = ?', [payload.placementId]);
 
-        db.prepare(
+        await tx.execute(
           `INSERT INTO event_logs (id, event_type, entity_type, entity_id, payload_json)
-           VALUES (?, 'impression_verified', 'impression', ?, ?)`
-        ).run(`evt_${crypto.randomUUID().slice(0, 12)}`, impressionId, JSON.stringify({ campaignId: payload.campaignId, billedMicros: actualBilled }));
+           VALUES (?, 'impression_verified', 'impression', ?, ?)`,
+          [
+            `evt_${crypto.randomUUID().slice(0, 12)}`,
+            impressionId,
+            JSON.stringify({ campaignId: payload.campaignId, billedMicros: actualBilled }),
+          ]
+        );
 
         return { duplicate: false, impressionId, billedMicros: actualBilled };
       });
@@ -576,26 +623,40 @@ export function createAdDeliveryRouter(db: DatabaseSync): Router {
   });
 
   // POST /api/v1/ad/click
-  router.post('/click', (req: Request, res: Response) => {
+  router.post('/click', async (req: Request, res: Response) => {
     const { clickToken, sessionId, simulateBot = false } = req.body ?? {};
     if (!clickToken || typeof clickToken !== 'string') {
       res.status(400).json({ error: 'clickToken is required' });
       return;
     }
 
-    const verified = verifyTrackingToken(clickToken, TRACKING_SECRET);
+    const verified = verifyTrackingToken(clickToken, getTrackingSecret());
     if (!verified.valid || verified.payload.eventType !== 'click') {
       res.status(400).json({ error: 'Invalid or expired click token' });
       return;
     }
 
     const payload = verified.payload;
-    const clientIp = (req.ip || req.socket.remoteAddress || '127.0.0.1').toString();
+    const clientIp = (req.ip || req.socket?.remoteAddress || '127.0.0.1').toString();
     const ipHash = hashIp(clientIp);
     const rawUa = String(req.headers['user-agent'] || '');
+    let allowSandboxUaNormalization = false;
+    if (req.body?.sandboxMode) {
+      const configuredAdapterKey = process.env.LOOMA_ADAPTER_KEY?.trim();
+      const providedAdapterKey = req.header('x-looma-adapter-key') || '';
+      if (configuredAdapterKey && timingSafeSecretMatch(providedAdapterKey, configuredAdapterKey)) {
+        allowSandboxUaNormalization = true;
+      } else {
+        const authRes = await authenticateBearerToken(db, req.header('authorization'));
+        if (authRes.ok && (authRes.session.role === 'publisher' || authRes.session.role === 'admin')) {
+          allowSandboxUaNormalization = true;
+        }
+      }
+    }
+
     const userAgent = simulateBot
       ? 'python-requests/2.31.0 AutomatedBot'
-      : req.body?.sandboxMode
+      : allowSandboxUaNormalization
         ? rawUa.replace(/HeadlessChrome/gi, 'Chrome')
         : rawUa;
     const sessionHash = hashIp(
@@ -603,43 +664,44 @@ export function createAdDeliveryRouter(db: DatabaseSync): Router {
     );
 
     try {
-      const result = withTransaction(db, () => {
-        const impRow = db
-          .prepare('SELECT id FROM impressions WHERE request_id = ?')
-          .get(payload.requestId) as { id: string } | undefined;
+      const result = await withTransaction(db, async (tx) => {
+        const impRow = await tx.queryOne<{ id: string }>(
+          'SELECT id FROM impressions WHERE request_id = ?',
+          [payload.requestId]
+        );
 
         if (!impRow) {
           return { errorStatus: 400, error: 'Impression must be verified before click attribution' };
         }
 
         const alreadyClicked = Boolean(
-          db.prepare('SELECT id FROM clicks WHERE impression_id = ?').get(impRow.id)
+          await tx.queryOne('SELECT id FROM clicks WHERE impression_id = ?', [impRow.id])
         );
 
-        const recentIpClicks = (
-          db
-            .prepare(
-              `SELECT COUNT(*) AS cnt FROM clicks WHERE ip_hash = ? AND created_at >= datetime('now', '-2 minutes')`
-            )
-            .get(ipHash) as { cnt: number }
-        ).cnt;
+        const twoMinutesAgoIso = new Date(Date.now() - 2 * 60_000).toISOString();
+        const fiveMinutesAgoIso = new Date(Date.now() - 5 * 60_000).toISOString();
 
-        const recentSessionImps = (
-          db
-            .prepare(
-              `SELECT COUNT(*) AS cnt FROM impressions WHERE session_hash = ? AND created_at >= datetime('now', '-5 minutes')`
-            )
-            .get(sessionHash) as { cnt: number }
-        ).cnt;
+        const recentIpClicksRow = await tx.queryOne<{ cnt: number }>(
+          'SELECT COUNT(*) AS cnt FROM clicks WHERE ip_hash = ? AND created_at >= ?',
+          [ipHash, twoMinutesAgoIso]
+        );
+        const recentIpClicks = Number(recentIpClicksRow?.cnt ?? 0);
 
-        const pubStats = db
-          .prepare(
-            `SELECT
-               (SELECT COUNT(*) FROM impressions WHERE publisher_id = ?) AS imps,
-               (SELECT COUNT(*) FROM clicks WHERE publisher_id = ? AND is_valid = 1) AS clks`
-          )
-          .get(payload.publisherId, payload.publisherId) as { imps: number; clks: number };
-        const publisherCtr = pubStats.imps > 10 ? pubStats.clks / pubStats.imps : 0.02;
+        const recentSessionImpsRow = await tx.queryOne<{ cnt: number }>(
+          'SELECT COUNT(*) AS cnt FROM impressions WHERE session_hash = ? AND created_at >= ?',
+          [sessionHash, fiveMinutesAgoIso]
+        );
+        const recentSessionImps = Number(recentSessionImpsRow?.cnt ?? 0);
+
+        const pubStats = await tx.queryOne<{ imps: number; clks: number }>(
+          `SELECT
+             (SELECT COUNT(*) FROM impressions WHERE publisher_id = ?) AS imps,
+             (SELECT COUNT(*) FROM clicks WHERE publisher_id = ? AND is_valid = 1) AS clks`,
+          [payload.publisherId, payload.publisherId]
+        );
+        const imps = Number(pubStats?.imps ?? 0);
+        const clks = Number(pubStats?.clks ?? 0);
+        const publisherCtr = imps > 10 ? clks / imps : 0.02;
 
         const fraudEval = evaluateTrafficQuality({
           userAgent,
@@ -650,17 +712,18 @@ export function createAdDeliveryRouter(db: DatabaseSync): Router {
         });
 
         if (fraudEval.shouldRaiseAlert && fraudEval.signalType) {
-          db.prepare(
+          await tx.execute(
             `INSERT INTO fraud_alerts (id, publisher_id, campaign_id, signal_type, severity, description, evidence_json, status)
-             VALUES (?, ?, ?, ?, ?, ?, ?, 'open')`
-          ).run(
-            `frd_${crypto.randomUUID().slice(0, 12)}`,
-            payload.publisherId,
-            payload.campaignId,
-            fraudEval.signalType,
-            fraudEval.severity,
-            `Detected ${fraudEval.signalType} on placement ${payload.placementId}`,
-            JSON.stringify({ recentIpClicks, recentSessionImps, publisherCtr })
+             VALUES (?, ?, ?, ?, ?, ?, ?, 'open')`,
+            [
+              `frd_${crypto.randomUUID().slice(0, 12)}`,
+              payload.publisherId,
+              payload.campaignId,
+              fraudEval.signalType,
+              fraudEval.severity,
+              `Detected ${fraudEval.signalType} on placement ${payload.placementId}`,
+              JSON.stringify({ recentIpClicks, recentSessionImps, publisherCtr }),
+            ]
           );
         }
 
@@ -676,7 +739,7 @@ export function createAdDeliveryRouter(db: DatabaseSync): Router {
           );
 
           if (grossBillMicros > 0) {
-            const captured = captureReservationInTx(db, {
+            const captured = await captureReservationInTx(tx, {
               advertiserId: payload.advertiserId,
               campaignId: payload.campaignId,
               requestId: payload.requestId,
@@ -688,7 +751,7 @@ export function createAdDeliveryRouter(db: DatabaseSync): Router {
 
             if (captured) {
               actualBilled = captured.capturedMicros;
-              const split = settlePublisherRevenueInTx(db, {
+              const split = await settlePublisherRevenueInTx(tx, {
                 publisherId: payload.publisherId,
                 actualBilled,
                 referenceType: 'click',
@@ -702,33 +765,34 @@ export function createAdDeliveryRouter(db: DatabaseSync): Router {
           }
         } else {
           recordFraudBlockedMetric();
-          releaseReservationInTx(
-            db,
+          await releaseReservationInTx(
+            tx,
             payload.requestId,
             `Released reservation after invalid click (${fraudEval.reason || 'fraud_blocked'})`
           );
         }
 
         const clickId = `clk_${crypto.randomUUID().slice(0, 12)}`;
-        db.prepare(
+        await tx.execute(
           `INSERT INTO clicks (id, impression_id, request_id, campaign_id, creative_id, placement_id, publisher_id, advertiser_id, is_valid, invalid_reason, billed_micros, publisher_share_micros, platform_fee_micros, ip_hash, session_hash)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-        ).run(
-          clickId,
-          impRow.id,
-          payload.requestId,
-          payload.campaignId,
-          payload.creativeId,
-          payload.placementId,
-          payload.publisherId,
-          payload.advertiserId,
-          fraudEval.isValid ? 1 : 0,
-          fraudEval.reason,
-          actualBilled,
-          publisherShareMicros,
-          platformFeeMicros,
-          ipHash,
-          sessionHash
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            clickId,
+            impRow.id,
+            payload.requestId,
+            payload.campaignId,
+            payload.creativeId,
+            payload.placementId,
+            payload.publisherId,
+            payload.advertiserId,
+            fraudEval.isValid ? 1 : 0,
+            fraudEval.reason,
+            actualBilled,
+            publisherShareMicros,
+            platformFeeMicros,
+            ipHash,
+            sessionHash,
+          ]
         );
 
         return {
@@ -753,7 +817,7 @@ export function createAdDeliveryRouter(db: DatabaseSync): Router {
   });
 
   // POST /api/v1/ad/conversion
-  router.post('/conversion', (req: Request, res: Response) => {
+  router.post('/conversion', async (req: Request, res: Response) => {
     const { conversionToken, eventName = 'purchase', conversionValueMicros = 0 } = req.body ?? {};
     if (!conversionToken || typeof conversionToken !== 'string') {
       res.status(400).json({ error: 'conversionToken is required', fieldErrors: { conversionToken: 'conversionToken is required.' } });
@@ -774,7 +838,7 @@ export function createAdDeliveryRouter(db: DatabaseSync): Router {
       return;
     }
 
-    const verified = verifyTrackingToken(conversionToken, TRACKING_SECRET);
+    const verified = verifyTrackingToken(conversionToken, getTrackingSecret());
     if (!verified.valid || verified.payload.eventType !== 'conversion') {
       res.status(400).json({ error: 'Invalid or expired conversion token' });
       return;
@@ -783,20 +847,23 @@ export function createAdDeliveryRouter(db: DatabaseSync): Router {
     const payload = verified.payload;
 
     try {
-      const outcome = withTransaction(db, () => {
-        const existing = db
-          .prepare('SELECT id FROM conversions WHERE request_id = ?')
-          .get(payload.requestId) as { id: string } | undefined;
+      const outcome = await withTransaction(db, async (tx) => {
+        const existing = await tx.queryOne<{ id: string }>(
+          'SELECT id FROM conversions WHERE request_id = ?',
+          [payload.requestId]
+        );
         if (existing) {
           return { duplicate: true, conversionId: existing.id, billedMicros: 0 };
         }
 
-        const clickRow = db
-          .prepare('SELECT id, impression_id FROM clicks WHERE request_id = ? AND is_valid = 1')
-          .get(payload.requestId) as { id: string; impression_id: string } | undefined;
-        const impRow = db
-          .prepare('SELECT id FROM impressions WHERE request_id = ?')
-          .get(payload.requestId) as { id: string } | undefined;
+        const clickRow = await tx.queryOne<{ id: string; impression_id: string }>(
+          'SELECT id, impression_id FROM clicks WHERE request_id = ? AND is_valid = 1',
+          [payload.requestId]
+        );
+        const impRow = await tx.queryOne<{ id: string }>(
+          'SELECT id FROM impressions WHERE request_id = ?',
+          [payload.requestId]
+        );
 
         const grossBillMicros = computeSingleEventBillMicros(
           payload.pricingModel,
@@ -809,7 +876,7 @@ export function createAdDeliveryRouter(db: DatabaseSync): Router {
         let platformFeeMicros = 0;
 
         if (grossBillMicros > 0) {
-          const captured = captureReservationInTx(db, {
+          const captured = await captureReservationInTx(tx, {
             advertiserId: payload.advertiserId,
             campaignId: payload.campaignId,
             requestId: payload.requestId,
@@ -821,7 +888,7 @@ export function createAdDeliveryRouter(db: DatabaseSync): Router {
 
           if (captured) {
             actualBilled = captured.capturedMicros;
-            const split = settlePublisherRevenueInTx(db, {
+            const split = await settlePublisherRevenueInTx(tx, {
               publisherId: payload.publisherId,
               actualBilled,
               referenceType: 'conversion',
@@ -835,32 +902,34 @@ export function createAdDeliveryRouter(db: DatabaseSync): Router {
         }
 
         const conversionId = `cnv_${crypto.randomUUID().slice(0, 12)}`;
-        db.prepare(
+        await tx.execute(
           `INSERT INTO conversions (id, click_id, request_id, campaign_id, advertiser_id, publisher_id, event_name, conversion_value_micros, billed_micros, publisher_share_micros, platform_fee_micros, is_valid)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`
-        ).run(
-          conversionId,
-          clickRow?.id || null,
-          payload.requestId,
-          payload.campaignId,
-          payload.advertiserId,
-          payload.publisherId,
-          String(eventName),
-          Math.max(0, Math.round(Number(conversionValueMicros) || 0)),
-          actualBilled,
-          publisherShareMicros,
-          platformFeeMicros
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
+          [
+            conversionId,
+            clickRow?.id || null,
+            payload.requestId,
+            payload.campaignId,
+            payload.advertiserId,
+            payload.publisherId,
+            String(eventName),
+            Math.max(0, Math.round(Number(conversionValueMicros) || 0)),
+            actualBilled,
+            publisherShareMicros,
+            platformFeeMicros,
+          ]
         );
 
-        db.prepare(
+        await tx.execute(
           `INSERT INTO attribution_records (id, conversion_id, click_id, impression_id, attribution_model, window_hours)
-           VALUES (?, ?, ?, ?, ?, 168)`
-        ).run(
-          `att_${crypto.randomUUID().slice(0, 12)}`,
-          conversionId,
-          clickRow?.id || null,
-          clickRow?.impression_id || impRow?.id || null,
-          clickRow ? 'last_click' : 'view_through'
+           VALUES (?, ?, ?, ?, ?, 168)`,
+          [
+            `att_${crypto.randomUUID().slice(0, 12)}`,
+            conversionId,
+            clickRow?.id || null,
+            clickRow?.impression_id || impRow?.id || null,
+            clickRow ? 'last_click' : 'view_through',
+          ]
         );
 
         return { duplicate: false, conversionId, billedMicros: actualBilled };
@@ -874,7 +943,7 @@ export function createAdDeliveryRouter(db: DatabaseSync): Router {
   });
 
   // POST /api/v1/ad/video-event (Quartile telemetry + CPV billing on verified complete)
-  router.post('/video-event', (req: Request, res: Response) => {
+  router.post('/video-event', async (req: Request, res: Response) => {
     const { videoToken, eventName = 'complete', watchedMs = 0 } = req.body ?? {};
     if (!videoToken || typeof videoToken !== 'string') {
       res.status(400).json({ error: 'videoToken is required', fieldErrors: { videoToken: 'videoToken is required.' } });
@@ -894,7 +963,7 @@ export function createAdDeliveryRouter(db: DatabaseSync): Router {
       return;
     }
 
-    const verified = verifyTrackingToken(videoToken, TRACKING_SECRET);
+    const verified = verifyTrackingToken(videoToken, getTrackingSecret());
     if (!verified.valid || verified.payload.eventType !== 'video') {
       res.status(400).json({ error: 'Invalid or expired video token' });
       return;
@@ -902,13 +971,14 @@ export function createAdDeliveryRouter(db: DatabaseSync): Router {
     const payload = verified.payload;
 
     try {
-      const outcome = withTransaction(db, () => {
+      const outcome = await withTransaction(db, async (tx) => {
         const alreadyCompleted =
           eventName === 'complete' &&
           Boolean(
-            db
-              .prepare("SELECT id FROM video_events WHERE request_id = ? AND event_name = 'complete'")
-              .get(payload.requestId)
+            await tx.queryOne(
+              "SELECT id FROM video_events WHERE request_id = ? AND event_name = 'complete'",
+              [payload.requestId]
+            )
           );
 
         let actualBilled = 0;
@@ -922,7 +992,7 @@ export function createAdDeliveryRouter(db: DatabaseSync): Router {
             'video_complete'
           );
           if (grossBillMicros > 0) {
-            const captured = captureReservationInTx(db, {
+            const captured = await captureReservationInTx(tx, {
               advertiserId: payload.advertiserId,
               campaignId: payload.campaignId,
               requestId: payload.requestId,
@@ -934,7 +1004,7 @@ export function createAdDeliveryRouter(db: DatabaseSync): Router {
 
             if (captured) {
               actualBilled = captured.capturedMicros;
-              const split = settlePublisherRevenueInTx(db, {
+              const split = await settlePublisherRevenueInTx(tx, {
                 publisherId: payload.publisherId,
                 actualBilled,
                 referenceType: 'video_view',
@@ -949,22 +1019,23 @@ export function createAdDeliveryRouter(db: DatabaseSync): Router {
         }
 
         const videoEventId = `vid_${crypto.randomUUID().slice(0, 12)}`;
-        db.prepare(
+        await tx.execute(
           `INSERT INTO video_events (id, request_id, campaign_id, creative_id, placement_id, publisher_id, advertiser_id, event_name, viewable_ms, billed_micros, publisher_share_micros, platform_fee_micros)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-        ).run(
-          videoEventId,
-          payload.requestId,
-          payload.campaignId,
-          payload.creativeId,
-          payload.placementId,
-          payload.publisherId,
-          payload.advertiserId,
-          eventName,
-          Math.max(0, Math.round(Number(watchedMs) || 0)),
-          actualBilled,
-          publisherShareMicros,
-          platformFeeMicros
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            videoEventId,
+            payload.requestId,
+            payload.campaignId,
+            payload.creativeId,
+            payload.placementId,
+            payload.publisherId,
+            payload.advertiserId,
+            eventName,
+            Math.max(0, Math.round(Number(watchedMs) || 0)),
+            actualBilled,
+            publisherShareMicros,
+            platformFeeMicros,
+          ]
         );
 
         return { videoEventId, eventName, duplicateComplete: alreadyCompleted, billedMicros: actualBilled };
@@ -978,7 +1049,7 @@ export function createAdDeliveryRouter(db: DatabaseSync): Router {
   });
 
   // POST /api/v1/ad/install (App install attribution + CPI billing)
-  router.post('/install', (req: Request, res: Response) => {
+  router.post('/install', async (req: Request, res: Response) => {
     const { installToken, appBundleId = 'com.app.unknown', deviceOs = 'iOS' } = req.body ?? {};
     if (!installToken || typeof installToken !== 'string') {
       res.status(400).json({ error: 'installToken is required', fieldErrors: { installToken: 'installToken is required.' } });
@@ -995,7 +1066,7 @@ export function createAdDeliveryRouter(db: DatabaseSync): Router {
       return;
     }
 
-    const verified = verifyTrackingToken(installToken, TRACKING_SECRET);
+    const verified = verifyTrackingToken(installToken, getTrackingSecret());
     if (!verified.valid || (verified.payload.eventType !== 'install' && verified.payload.eventType !== 'conversion')) {
       res.status(400).json({ error: 'Invalid or expired install token' });
       return;
@@ -1003,10 +1074,11 @@ export function createAdDeliveryRouter(db: DatabaseSync): Router {
     const payload = verified.payload;
 
     try {
-      const outcome = withTransaction(db, () => {
-        const existing = db
-          .prepare('SELECT id FROM app_installs WHERE request_id = ?')
-          .get(payload.requestId) as { id: string } | undefined;
+      const outcome = await withTransaction(db, async (tx) => {
+        const existing = await tx.queryOne<{ id: string }>(
+          'SELECT id FROM app_installs WHERE request_id = ?',
+          [payload.requestId]
+        );
         if (existing) {
           return { duplicate: true, installId: existing.id, billedMicros: 0 };
         }
@@ -1022,7 +1094,7 @@ export function createAdDeliveryRouter(db: DatabaseSync): Router {
         let platformFeeMicros = 0;
 
         if (grossBillMicros > 0) {
-          const captured = captureReservationInTx(db, {
+          const captured = await captureReservationInTx(tx, {
             advertiserId: payload.advertiserId,
             campaignId: payload.campaignId,
             requestId: payload.requestId,
@@ -1034,7 +1106,7 @@ export function createAdDeliveryRouter(db: DatabaseSync): Router {
 
           if (captured) {
             actualBilled = captured.capturedMicros;
-            const split = settlePublisherRevenueInTx(db, {
+            const split = await settlePublisherRevenueInTx(tx, {
               publisherId: payload.publisherId,
               actualBilled,
               referenceType: 'app_install',
@@ -1048,20 +1120,21 @@ export function createAdDeliveryRouter(db: DatabaseSync): Router {
         }
 
         const installId = `ins_${crypto.randomUUID().slice(0, 12)}`;
-        db.prepare(
+        await tx.execute(
           `INSERT INTO app_installs (id, request_id, campaign_id, advertiser_id, publisher_id, app_bundle_id, device_os, billed_micros, publisher_share_micros, platform_fee_micros)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-        ).run(
-          installId,
-          payload.requestId,
-          payload.campaignId,
-          payload.advertiserId,
-          payload.publisherId,
-          String(appBundleId).slice(0, 120),
-          String(deviceOs).slice(0, 40),
-          actualBilled,
-          publisherShareMicros,
-          platformFeeMicros
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            installId,
+            payload.requestId,
+            payload.campaignId,
+            payload.advertiserId,
+            payload.publisherId,
+            String(appBundleId).slice(0, 120),
+            String(deviceOs).slice(0, 40),
+            actualBilled,
+            publisherShareMicros,
+            platformFeeMicros,
+          ]
         );
 
         return { duplicate: false, installId, billedMicros: actualBilled };
@@ -1075,19 +1148,18 @@ export function createAdDeliveryRouter(db: DatabaseSync): Router {
   });
 
   // GET /api/v1/ad/creative/:id
-  router.get('/creative/:id', (req: Request, res: Response) => {
-    const row = db
-      .prepare(
-        `SELECT crt.id, crt.title, crt.description, crt.media_url, crt.destination_url, crt.cta_text, crt.dimensions, crt.approval_status, adv.format
-         FROM ad_creatives crt
-         JOIN advertisements adv ON adv.id = crt.advertisement_id
-         JOIN campaigns c ON c.id = adv.campaign_id
-         WHERE crt.id = ?
-           AND crt.approval_status = 'approved'
-           AND c.status = 'active'
-           AND c.moderation_status = 'approved'`
-      )
-      .get(String(req.params.id));
+  router.get('/creative/:id', async (req: Request, res: Response) => {
+    const row = await db.queryOne(
+      `SELECT crt.id, crt.title, crt.description, crt.media_url, crt.destination_url, crt.cta_text, crt.dimensions, crt.approval_status, adv.format
+       FROM ad_creatives crt
+       JOIN advertisements adv ON adv.id = crt.advertisement_id
+       JOIN campaigns c ON c.id = adv.campaign_id
+       WHERE crt.id = ?
+         AND crt.approval_status = 'approved'
+         AND c.status = 'active'
+         AND c.moderation_status = 'approved'`,
+      [String(req.params.id)]
+    );
     if (!row) {
       res.status(404).json({ error: 'Creative not found' });
       return;
@@ -1134,12 +1206,16 @@ export function getPublisherSdkScript(): string {
       desc.textContent = data.ad.description;
       desc.style.cssText = 'font-size:13px;color:#475569;margin:0 0 12px 0;';
       var cta = d.createElement('a');
-      cta.href = data.ad.destinationUrl;
+      var dest = typeof data.ad.destinationUrl === 'string' && /^https?:\\/\\//i.test(data.ad.destinationUrl)
+        ? data.ad.destinationUrl
+        : '#';
+      cta.href = dest;
       cta.textContent = data.ad.ctaText;
       cta.target = '_blank';
       cta.rel = 'noopener noreferrer sponsored';
       cta.style.cssText = 'display:inline-block;padding:8px 14px;background:#1d4ed8;color:#ffffff;text-decoration:none;border-radius:6px;font-size:13px;font-weight:500;';
-      cta.addEventListener('click', function() {
+      cta.addEventListener('click', function(ev) {
+        if (dest === '#') ev.preventDefault();
         fetch('/api/v1/ad/click', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },

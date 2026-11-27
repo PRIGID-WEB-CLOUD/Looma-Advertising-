@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import dns from 'node:dns/promises';
 import net from 'node:net';
-import type { DatabaseSync } from 'node:sqlite';
+import type { DbClient } from './db/postgres';
 
 // ============================================================================
 // 1. MULTI-CURRENCY FX RATES (Base ledger stays strictly in integer USD micros)
@@ -154,6 +154,12 @@ export interface ProviderCheckoutResult {
   status: 'completed' | 'pending';
 }
 
+export function isLiveProviderCredential(secret?: string): boolean {
+  const trimmed = secret?.trim();
+  if (!trimmed) return false;
+  return !/^(demo[_-]|sk_demo_|pk_demo_|flwseck_demo|whsec_demo|flwhash_demo)/i.test(trimmed);
+}
+
 export async function initializeProviderDeposit(params: {
   provider: 'paystack' | 'flutterwave' | 'stripe' | 'bank_transfer';
   amountUsd: number;
@@ -162,7 +168,7 @@ export async function initializeProviderDeposit(params: {
 }): Promise<ProviderCheckoutResult> {
   const { provider, amountUsd, email, reference } = params;
 
-  if (provider === 'paystack' && process.env.PAYSTACK_SECRET_KEY) {
+  if (provider === 'paystack' && isLiveProviderCredential(process.env.PAYSTACK_SECRET_KEY)) {
     const res = await fetch('https://api.paystack.co/transaction/initialize', {
       method: 'POST',
       headers: {
@@ -189,7 +195,7 @@ export async function initializeProviderDeposit(params: {
     };
   }
 
-  if (provider === 'flutterwave' && process.env.FLUTTERWAVE_SECRET_KEY) {
+  if (provider === 'flutterwave' && isLiveProviderCredential(process.env.FLUTTERWAVE_SECRET_KEY)) {
     const res = await fetch('https://api.flutterwave.com/v3/payments', {
       method: 'POST',
       headers: {
@@ -217,7 +223,7 @@ export async function initializeProviderDeposit(params: {
     };
   }
 
-  if (provider === 'stripe' && process.env.STRIPE_SECRET_KEY) {
+  if (provider === 'stripe' && isLiveProviderCredential(process.env.STRIPE_SECRET_KEY)) {
     const body = new URLSearchParams({
       amount: String(Math.round(amountUsd * 100)),
       currency: 'usd',
@@ -261,7 +267,11 @@ export async function dispatchProviderPayout(params: {
 }): Promise<{ mode: 'live' | 'sandbox'; transferRef: string }> {
   const { payoutMethod, destination, amountUsd, withdrawalId } = params;
   // Live Paystack transfer when Paystack secret is configured and destination is a recipient code
-  if (payoutMethod === 'paystack' && process.env.PAYSTACK_SECRET_KEY && destination.startsWith('RCP_')) {
+  if (
+    payoutMethod === 'paystack' &&
+    isLiveProviderCredential(process.env.PAYSTACK_SECRET_KEY) &&
+    destination.startsWith('RCP_')
+  ) {
     const res = await fetch('https://api.paystack.co/transfer', {
       method: 'POST',
       headers: {
@@ -360,10 +370,28 @@ export async function verifyDomainOwnershipLive(
   }
 
   // Resolve IP addresses first to block SSRF to loopback/private/link-local targets
-  let addresses: Array<{ address: string }>;
+  let addresses: Array<{ address: string }> = [];
   try {
     addresses = await dns.lookup(domain, { all: true });
   } catch {
+    // Fallback to DNS-over-HTTPS when running in edge Workers without node:dns socket support
+    try {
+      const dohRes = await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(domain)}&type=A`, {
+        headers: { Accept: 'application/dns-json' },
+        signal: AbortSignal.timeout(4000),
+      });
+      if (dohRes.ok) {
+        const dohData = (await dohRes.json()) as { Answer?: Array<{ type: number; data: string }> };
+        addresses = (dohData.Answer || [])
+          .filter((a) => a.type === 1 && a.data)
+          .map((a) => ({ address: a.data }));
+      }
+    } catch {
+      addresses = [];
+    }
+  }
+
+  if (addresses.length === 0) {
     return {
       verified: false,
       method,
@@ -373,7 +401,7 @@ export async function verifyDomainOwnershipLive(
     };
   }
 
-  if (addresses.length === 0 || addresses.some((a) => isPrivateIp(a.address))) {
+  if (addresses.some((a) => isPrivateIp(a.address))) {
     return {
       verified: false,
       method,
@@ -385,8 +413,25 @@ export async function verifyDomainOwnershipLive(
 
   if (method === 'dns_txt') {
     try {
-      const txtGroups = await dns.resolveTxt(domain);
-      const flattened = txtGroups.map((chunks) => chunks.join(''));
+      let flattened: string[] = [];
+      try {
+        const txtGroups = await dns.resolveTxt(domain);
+        flattened = txtGroups.map((chunks) => chunks.join(''));
+      } catch {
+        const dohRes = await fetch(
+          `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(domain)}&type=TXT`,
+          {
+            headers: { Accept: 'application/dns-json' },
+            signal: AbortSignal.timeout(4000),
+          }
+        );
+        if (dohRes.ok) {
+          const dohData = (await dohRes.json()) as { Answer?: Array<{ type: number; data: string }> };
+          flattened = (dohData.Answer || [])
+            .filter((a) => a.type === 16 && a.data)
+            .map((a) => a.data.replace(/^"|"$/g, '').replace(/"\s+"/g, ''));
+        }
+      }
       const matched = flattened.some((record) => record.includes(expectedToken));
       return {
         verified: matched,
@@ -486,25 +531,26 @@ export function scanProhibitedContent(
 // ============================================================================
 // 7. TRANSACTIONAL EMAIL DISPATCHER (DB OUTBOX + OPTIONAL WEBHOOK)
 // ============================================================================
-export function queueTransactionalEmail(
-  db: DatabaseSync,
+export async function queueTransactionalEmail(
+  db: DbClient,
   params: { to: string; subject: string; bodyText: string; category?: string }
-): string {
+): Promise<string> {
   const id = `eml_${crypto.randomUUID().slice(0, 12)}`;
   const webhookUrl = process.env.EMAIL_WEBHOOK_URL;
   const status = webhookUrl ? 'dispatched' : 'logged';
 
-  db.prepare(
+  await db.execute(
     `INSERT INTO email_outbox (id, recipient_email, subject, body_text, category, delivery_status, provider_response)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`
-  ).run(
-    id,
-    params.to,
-    params.subject,
-    params.bodyText,
-    params.category || 'transactional',
-    status,
-    webhookUrl ? 'Async dispatch queued' : 'Stored in transactional outbox (configure EMAIL_WEBHOOK_URL for live SMTP/API)'
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    [
+      id,
+      params.to,
+      params.subject,
+      params.bodyText,
+      params.category || 'transactional',
+      status,
+      webhookUrl ? 'Async dispatch queued' : 'Stored in transactional outbox (configure EMAIL_WEBHOOK_URL for live SMTP/API)',
+    ]
   );
 
   if (webhookUrl) {

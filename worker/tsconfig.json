@@ -1,0 +1,30 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022", "WebWorker"],
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "types": ["@cloudflare/workers-types", "node"]
+  },
+  "include": [
+    "./**/*.ts",
+    "../server/db/postgres.ts",
+    "../server/db/schema.ts",
+    "../server/db/drizzle-schema.ts",
+    "../server/http/**/*.ts",
+    "../server/routes/**/*.ts",
+    "../server/modules/**/*.ts",
+    "../server/auth.ts",
+    "../server/engine.ts",
+    "../server/jobs.ts",
+    "../server/security.ts",
+    "../server/seed.ts"
+  ]
+}

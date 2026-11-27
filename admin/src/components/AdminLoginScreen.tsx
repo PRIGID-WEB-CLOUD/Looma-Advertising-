@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { ArrowLeft, Eye, EyeOff, Moon, ShieldCheck, Sun } from 'lucide-react';
+import { ArrowLeft, Eye, EyeOff, Moon, Sun } from 'lucide-react';
 import { apiRequest, AuthUser, extractFieldErrors } from '../lib/api';
 import { FieldError, fieldBorderClass } from './FieldError';
 import {
@@ -225,10 +225,19 @@ export const AdminLoginScreen: React.FC<AdminLoginScreenProps> = ({
           }}
         />
 
-        <div className="relative z-10 flex items-center gap-3">
-          <div className="w-8 h-8 rounded-lg bg-blue-600 flex items-center justify-center shrink-0">
-            <ShieldCheck className="w-4 h-4 text-white" />
-          </div>
+        <div className="relative z-10 flex items-center gap-2.5">
+          <svg
+            width="28"
+            height="28"
+            viewBox="0 0 24 24"
+            fill="none"
+            aria-hidden="true"
+            className="shrink-0 text-blue-500"
+          >
+            <rect x="2" y="2" width="20" height="20" rx="5" fill="currentColor" />
+            <path d="M8 7V17H16.5" stroke="white" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" />
+            <rect x="13" y="7" width="3.5" height="3.5" rx="0.75" fill="white" fillOpacity="0.9" />
+          </svg>
           <div className="flex items-center gap-2 min-w-0">
             <span className="font-display text-lg font-bold tracking-tight text-white whitespace-nowrap">
               Looma Admin
@@ -264,10 +273,10 @@ export const AdminLoginScreen: React.FC<AdminLoginScreenProps> = ({
               </p>
             </div>
             <div className="py-4">
-              <div className="text-xs font-semibold text-slate-100">Deployment Configuration</div>
+              <div className="text-xs font-semibold text-slate-100">Prepaid Financial Controls</div>
               <p className="text-xs text-slate-400 mt-1 leading-relaxed">
-                Configure <code className="font-mono text-slate-300">ADMIN_PASSCODE</code> and payment webhook secrets
-                in Settings &rarr; Secrets prior to sharing.
+                Verify wallet ledger transactions, review refund requests, and enforce atomic budget integrity across
+                all active campaigns.
               </p>
             </div>
           </div>
@@ -284,9 +293,18 @@ export const AdminLoginScreen: React.FC<AdminLoginScreenProps> = ({
       <div className="lg:col-span-7 flex flex-col min-h-screen bg-white dark:bg-slate-950">
         <header className="h-16 px-4 sm:px-8 lg:px-10 flex items-center justify-between border-b border-slate-200/80 dark:border-slate-800/80 lg:border-b-0 shrink-0">
           <div className="flex items-center gap-2.5 lg:invisible">
-            <div className="w-7 h-7 rounded-md bg-blue-700 flex items-center justify-center shrink-0">
-              <ShieldCheck className="w-3.5 h-3.5 text-white" />
-            </div>
+            <svg
+              width="24"
+              height="24"
+              viewBox="0 0 24 24"
+              fill="none"
+              aria-hidden="true"
+              className="shrink-0 text-blue-700 dark:text-blue-500"
+            >
+              <rect x="2" y="2" width="20" height="20" rx="5" fill="currentColor" />
+              <path d="M8 7V17H16.5" stroke="white" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" />
+              <rect x="13" y="7" width="3.5" height="3.5" rx="0.75" fill="white" fillOpacity="0.9" />
+            </svg>
             <span className="font-display text-base font-bold tracking-tight text-slate-900 dark:text-white whitespace-nowrap">
               Looma Admin
             </span>
@@ -373,6 +391,13 @@ export const AdminLoginScreen: React.FC<AdminLoginScreenProps> = ({
                 >
                   Sign In
                 </button>
+              </div>
+            )}
+
+            {mode === 'login' && setupStatus && !setupStatus.envPasscodeConfigured && setupStatus.adminClaimed && (
+              <div className="mb-5 p-3.5 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/60 text-xs text-slate-600 dark:text-slate-300 leading-relaxed">
+                Administrator credentials have already been claimed for this environment. Sign in with your operator
+                email and password, or use <span className="font-medium">Forgot password?</span> to reset access.
               </div>
             )}
 

@@ -1,9 +1,27 @@
 import crypto from 'node:crypto';
-import type { NextFunction, Request, Response } from 'express';
-import type { DatabaseSync } from 'node:sqlite';
+import type { NextFunction, Request, Response } from './http/router';
+import type { DbClient } from './db/postgres';
 
-const RUNTIME_SECRET = process.env.LOOMA_SESSION_SECRET || crypto.randomBytes(32).toString('hex');
-export const TRACKING_SECRET = process.env.LOOMA_TRACKING_SECRET || crypto.randomBytes(32).toString('hex');
+let fallbackSessionSecret: string | null = null;
+let fallbackTrackingSecret: string | null = null;
+
+export function getSessionSecret(): string {
+  const configured = process.env.LOOMA_SESSION_SECRET?.trim();
+  if (configured) return configured;
+  if (!fallbackSessionSecret) {
+    fallbackSessionSecret = crypto.randomBytes(32).toString('hex');
+  }
+  return fallbackSessionSecret;
+}
+
+export function getTrackingSecret(): string {
+  const configured = process.env.LOOMA_TRACKING_SECRET?.trim();
+  if (configured) return configured;
+  if (!fallbackTrackingSecret) {
+    fallbackTrackingSecret = crypto.randomBytes(32).toString('hex');
+  }
+  return fallbackTrackingSecret;
+}
 
 export interface SessionPayload {
   userId: string;
@@ -58,7 +76,7 @@ export function signSessionToken(
     exp: now + 1000 * 60 * 60 * 24, // 24 hours
   };
   const encoded = Buffer.from(JSON.stringify(fullPayload)).toString('base64url');
-  const sig = crypto.createHmac('sha256', RUNTIME_SECRET).update(encoded).digest('base64url');
+  const sig = crypto.createHmac('sha256', getSessionSecret()).update(encoded).digest('base64url');
   return `${encoded}.${sig}`;
 }
 
@@ -66,7 +84,7 @@ export function verifySessionToken(token: string): SessionPayload | null {
   const parts = token.split('.');
   if (parts.length !== 2) return null;
   const [encoded, sig] = parts;
-  const expectedSig = crypto.createHmac('sha256', RUNTIME_SECRET).update(encoded).digest('base64url');
+  const expectedSig = crypto.createHmac('sha256', getSessionSecret()).update(encoded).digest('base64url');
   const sigBuf = Buffer.from(sig);
   const expectedBuf = Buffer.from(expectedSig);
   if (sigBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(sigBuf, expectedBuf)) {
@@ -81,16 +99,18 @@ export function verifySessionToken(token: string): SessionPayload | null {
   }
 }
 
-export function revokeSessionToken(db: DatabaseSync, token: string, expMs: number): void {
+export async function revokeSessionToken(db: DbClient, token: string, expMs: number): Promise<void> {
   const tokenHash = hashToken(token);
-  const expSec = Math.floor(Math.max(Date.now(), expMs) / 1000);
-  db.prepare(
-    `INSERT OR REPLACE INTO revoked_tokens (token_hash, expires_at)
-     VALUES (?, datetime(?, 'unixepoch'))`
-  ).run(tokenHash, expSec);
+  const expIso = new Date(Math.max(Date.now(), expMs)).toISOString();
+  await db.execute(
+    `INSERT INTO revoked_tokens (token_hash, expires_at)
+     VALUES (?, ?)
+     ON CONFLICT (token_hash) DO UPDATE SET expires_at = excluded.expires_at`,
+    [tokenHash, expIso]
+  );
 }
 
-export function authenticateBearerToken(db: DatabaseSync, authorizationHeader: string | undefined): {
+export async function authenticateBearerToken(db: DbClient, authorizationHeader: string | undefined): Promise<{
   ok: true;
   session: SessionPayload;
   rawToken: string;
@@ -98,7 +118,7 @@ export function authenticateBearerToken(db: DatabaseSync, authorizationHeader: s
   ok: false;
   status: number;
   error: string;
-} {
+}> {
   if (!authorizationHeader || !authorizationHeader.startsWith('Bearer ')) {
     return { ok: false, status: 401, error: 'Authentication required' };
   }
@@ -108,21 +128,23 @@ export function authenticateBearerToken(db: DatabaseSync, authorizationHeader: s
     return { ok: false, status: 401, error: 'Invalid or expired session token' };
   }
 
-  const revoked = db.prepare('SELECT token_hash FROM revoked_tokens WHERE token_hash = ?').get(hashToken(token));
+  const revoked = await db.queryOne('SELECT token_hash FROM revoked_tokens WHERE token_hash = ?', [hashToken(token)]);
   if (revoked) {
     return { ok: false, status: 401, error: 'Session has been revoked. Please sign in again.' };
   }
 
-  const userRow = db
-    .prepare(
-      `SELECT u.id, u.status, u.token_valid_after, r.name AS role
-       FROM users u
-       JOIN roles r ON r.id = u.role_id
-       WHERE u.id = ?`
-    )
-    .get(session.userId) as
-    | { id: string; status: string; token_valid_after: number; role: 'advertiser' | 'publisher' | 'admin' }
-    | undefined;
+  const userRow = await db.queryOne<{
+    id: string;
+    status: string;
+    token_valid_after: number;
+    role: 'advertiser' | 'publisher' | 'admin';
+  }>(
+    `SELECT u.id, u.status, u.token_valid_after, r.name AS role
+     FROM users u
+     JOIN roles r ON r.id = u.role_id
+     WHERE u.id = ?`,
+    [session.userId]
+  );
 
   if (!userRow || userRow.status !== 'active') {
     return { ok: false, status: 403, error: 'Account is suspended or unavailable' };
@@ -133,23 +155,27 @@ export function authenticateBearerToken(db: DatabaseSync, authorizationHeader: s
   }
 
   const issuedAt = typeof session.iat === 'number' ? session.iat : 0;
-  if (userRow.token_valid_after > 0 && issuedAt < userRow.token_valid_after) {
+  if (Number(userRow.token_valid_after) > 0 && issuedAt < Number(userRow.token_valid_after)) {
     return { ok: false, status: 401, error: 'Session invalidated after security update. Please sign in again.' };
   }
 
   return { ok: true, session, rawToken: token };
 }
 
-export function createAuthMiddleware(db: DatabaseSync) {
-  return (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
-    const result = authenticateBearerToken(db, req.headers.authorization);
-    if (!result.ok) {
-      res.status(result.status).json({ error: result.error });
-      return;
+export function createAuthMiddleware(db: DbClient) {
+  return async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+    try {
+      const result = await authenticateBearerToken(db, req.header('authorization'));
+      if (!result.ok) {
+        res.status(result.status).json({ error: result.error });
+        return;
+      }
+      req.auth = result.session;
+      req.rawToken = result.rawToken;
+      next();
+    } catch (err) {
+      next(err);
     }
-    req.auth = result.session;
-    req.rawToken = result.rawToken;
-    next();
   };
 }
 

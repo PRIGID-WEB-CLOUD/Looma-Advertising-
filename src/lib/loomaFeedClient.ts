@@ -80,6 +80,7 @@ export function resetLoomaFeedCircuitBreaker(): void {
 export async function fetchLoomaFeedAds(options: {
   endpoint?: string;
   adapterKey?: string;
+  authToken?: string | null;
   slots?: LoomaFeedSlotSpec[];
   country?: string;
   language?: string;
@@ -119,6 +120,9 @@ export async function fetchLoomaFeedAds(options: {
     };
     if (options.adapterKey) {
       headers['x-looma-adapter-key'] = options.adapterKey;
+    }
+    if (options.authToken) {
+      headers.Authorization = `Bearer ${options.authToken}`;
     }
 
     const res = await fetch(endpoint, {

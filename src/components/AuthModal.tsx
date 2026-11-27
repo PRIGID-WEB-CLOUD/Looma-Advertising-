@@ -150,7 +150,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
         }
         if (res.token && res.user) {
           if (res.user.role === 'admin') {
-            setError('Administrator accounts must sign in through the standalone Looma Admin console (/admin).');
+            setError('Administrator accounts cannot sign in through the advertiser and publisher portal.');
             return;
           }
           onAuthenticated(res.token, res.user);
@@ -276,13 +276,19 @@ export const AuthModal: React.FC<AuthModalProps> = ({
             }}
           />
 
-          <div className="relative z-10 flex items-center gap-3">
-            <div className="w-8 h-8 rounded-lg bg-blue-600 flex items-center justify-center shrink-0">
-              <svg viewBox="0 0 24 24" className="w-4 h-4 text-white" fill="none" stroke="currentColor" strokeWidth="2.4">
-                <path d="M5 5v14h14" strokeLinecap="round" strokeLinejoin="round" />
-                <path d="M10 14l4-4 4 4" strokeLinecap="round" strokeLinejoin="round" />
-              </svg>
-            </div>
+          <div className="relative z-10 flex items-center gap-2.5">
+            <svg
+              width="28"
+              height="28"
+              viewBox="0 0 24 24"
+              fill="none"
+              aria-hidden="true"
+              className="shrink-0 text-blue-500"
+            >
+              <rect x="2" y="2" width="20" height="20" rx="5" fill="currentColor" />
+              <path d="M8 7V17H16.5" stroke="white" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" />
+              <rect x="13" y="7" width="3.5" height="3.5" rx="0.75" fill="white" fillOpacity="0.9" />
+            </svg>
             <span className="font-display text-lg font-bold tracking-tight text-white whitespace-nowrap">
               Looma Advertising
             </span>
@@ -331,12 +337,18 @@ export const AuthModal: React.FC<AuthModalProps> = ({
         <div className="lg:col-span-7 flex flex-col min-h-screen bg-white dark:bg-slate-950">
           <header className="h-16 px-4 sm:px-8 lg:px-10 flex items-center justify-between border-b border-slate-200/80 dark:border-slate-800/80 lg:border-b-0 shrink-0">
             <div className="flex items-center gap-2.5 lg:invisible">
-              <div className="w-7 h-7 rounded-md bg-blue-700 flex items-center justify-center shrink-0">
-                <svg viewBox="0 0 24 24" className="w-3.5 h-3.5 text-white" fill="none" stroke="currentColor" strokeWidth="2.4">
-                  <path d="M5 5v14h14" strokeLinecap="round" strokeLinejoin="round" />
-                  <path d="M10 14l4-4 4 4" strokeLinecap="round" strokeLinejoin="round" />
-                </svg>
-              </div>
+              <svg
+                width="24"
+                height="24"
+                viewBox="0 0 24 24"
+                fill="none"
+                aria-hidden="true"
+                className="shrink-0 text-blue-700 dark:text-blue-500"
+              >
+                <rect x="2" y="2" width="20" height="20" rx="5" fill="currentColor" />
+                <path d="M8 7V17H16.5" stroke="white" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" />
+                <rect x="13" y="7" width="3.5" height="3.5" rx="0.75" fill="white" fillOpacity="0.9" />
+              </svg>
               <span className="font-display text-base font-bold tracking-tight text-slate-900 dark:text-white whitespace-nowrap">
                 Looma Advertising
               </span>

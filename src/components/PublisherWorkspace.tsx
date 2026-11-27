@@ -1,9 +1,17 @@
 import React, { useEffect, useState } from 'react';
-import { Plus, CheckCircle2, MousePointerClick, Sparkles, AlertTriangle, X } from 'lucide-react';
-import { apiRequest, extractFieldErrors, formatMicros, formatNumber, formatPct } from '../lib/api';
+import { Plus, CheckCircle2, MousePointerClick, Sparkles, AlertTriangle, X, Eye } from 'lucide-react';
+import { apiRequest, extractFieldErrors, formatMicros, formatNumber, formatPct, getAuthToken } from '../lib/api';
 import { fetchLoomaFeedAds, type LoomaFeedFetchResult } from '../lib/loomaFeedClient';
 import { PerformanceChart } from './Charts';
 import { FieldError, fieldBorderClass } from './FieldError';
+import { LiveAdPreview } from './LiveAdPreview';
+import {
+  type AdFormat,
+  AD_FORMAT_SPECS,
+  applyPlacementFormatChange,
+  getPlacementFormatSpec,
+  getSampleCreativeForFormat,
+} from '../lib/adFormats';
 import {
   type FieldErrors,
   validatePayoutMethodInput,
@@ -119,6 +127,8 @@ export const PublisherWorkspace: React.FC<PublisherWorkspaceProps> = ({ activeTa
     dimensions: 'responsive',
     floorCpmUsd: 0.75,
   });
+  const [previewCreativeFormat, setPreviewCreativeFormat] = useState<AdFormat>('native');
+  const [inspectedPlacementId, setInspectedPlacementId] = useState<string | null>(null);
 
   const [withdrawUsd, setWithdrawUsd] = useState('100');
   const [payoutMethodType, setPayoutMethodType] = useState('bank_transfer');
@@ -173,6 +183,7 @@ export const PublisherWorkspace: React.FC<PublisherWorkspaceProps> = ({ activeTa
       campaignName: string;
       creativeId: string;
       format: string;
+      dimensions?: string;
       pricingModel: string;
       title: string;
       description: string;
@@ -533,6 +544,7 @@ export const PublisherWorkspace: React.FC<PublisherWorkspaceProps> = ({ activeTa
         placementId: pl.id,
       }));
       const res = await fetchLoomaFeedAds({
+        authToken: getAuthToken(),
         slots: slots.length > 0 ? slots : undefined,
         country: sandboxConfig.country,
         deviceCategory: sandboxConfig.deviceCategory,
@@ -848,168 +860,334 @@ export const PublisherWorkspace: React.FC<PublisherWorkspaceProps> = ({ activeTa
       )}
 
       {/* TAB: AD PLACEMENTS */}
-      {tab === 'placements' && (
-        <div className="grid lg:grid-cols-12 gap-6 items-start">
-          <form
-            onSubmit={handleAddPlacement}
-            noValidate
-            className="lg:col-span-4 min-w-0 border border-slate-200 dark:border-slate-800 rounded-xl p-4 sm:p-5 bg-white dark:bg-slate-900 space-y-3.5"
-          >
-            <h2 className="text-base font-semibold">Create Ad Unit Placement</h2>
-            <div>
-              <label htmlFor="plc-prop" className="block text-xs font-medium mb-1">Property</label>
-              <select
-                id="plc-prop"
-                value={placeForm.propertyId}
-                onChange={(e) => {
-                  setPlaceForm({ ...placeForm, propertyId: e.target.value });
-                  clearPlaceError('propertyId');
-                }}
-                aria-invalid={Boolean(placeErrors.propertyId)}
-                aria-describedby={placeErrors.propertyId ? 'plc-prop-err' : undefined}
-                className={`w-full px-3 py-2 text-sm rounded-lg border ${fieldBorderClass(Boolean(placeErrors.propertyId))} bg-white dark:bg-slate-950`}
-              >
-                {properties.length === 0 && <option value="">No registered properties</option>}
-                {properties.map((p) => (
-                  <option key={p.id} value={p.id}>
-                    {p.name} ({p.domain_or_bundle})
-                  </option>
-                ))}
-              </select>
-              <FieldError id="plc-prop-err" message={placeErrors.propertyId} />
-            </div>
-            <div>
-              <label htmlFor="plc-name" className="block text-xs font-medium mb-1">Placement Name</label>
-              <input
-                id="plc-name"
-                type="text"
-                required
-                value={placeForm.name}
-                onChange={(e) => {
-                  setPlaceForm({ ...placeForm, name: e.target.value });
-                  clearPlaceError('name');
-                }}
-                aria-invalid={Boolean(placeErrors.name)}
-                aria-describedby={placeErrors.name ? 'plc-name-err' : undefined}
-                placeholder="Sidebar Native Unit"
-                className={`w-full px-3 py-2 text-sm rounded-lg border ${fieldBorderClass(Boolean(placeErrors.name))} bg-white dark:bg-slate-950`}
-              />
-              <FieldError id="plc-name-err" message={placeErrors.name} />
-            </div>
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-              <div>
-                <label htmlFor="plc-format" className="block text-xs font-medium mb-1">Format</label>
-                <select
-                  id="plc-format"
-                  value={placeForm.format}
-                  onChange={(e) => {
-                    setPlaceForm({ ...placeForm, format: e.target.value });
-                    clearPlaceError('format');
-                  }}
-                  className={`w-full px-3 py-2 text-sm rounded-lg border ${fieldBorderClass(Boolean(placeErrors.format))} bg-white dark:bg-slate-950`}
-                >
-                  <option value="native">Native</option>
-                  <option value="banner">Display Banner</option>
-                  <option value="responsive">Responsive</option>
-                  <option value="in_feed">In-Feed</option>
-                  <option value="video">Video</option>
-                  <option value="interstitial">Interstitial</option>
-                </select>
-                <FieldError id="plc-format-err" message={placeErrors.format} />
-              </div>
-              <div>
-                <label htmlFor="plc-dims" className="block text-xs font-medium mb-1">Dimensions</label>
-                <input
-                  id="plc-dims"
-                  type="text"
-                  value={placeForm.dimensions}
-                  onChange={(e) => {
-                    setPlaceForm({ ...placeForm, dimensions: e.target.value });
-                    clearPlaceError('dimensions');
-                  }}
-                  aria-invalid={Boolean(placeErrors.dimensions)}
-                  aria-describedby={placeErrors.dimensions ? 'plc-dims-err' : undefined}
-                  className={`w-full px-3 py-2 text-sm font-mono rounded-lg border ${fieldBorderClass(Boolean(placeErrors.dimensions))} bg-white dark:bg-slate-950`}
-                />
-                <FieldError id="plc-dims-err" message={placeErrors.dimensions} />
-              </div>
-            </div>
-            <div>
-              <label htmlFor="plc-floor" className="block text-xs font-medium mb-1">Floor CPM (USD)</label>
-              <input
-                id="plc-floor"
-                type="number"
-                step="0.1"
-                min="0.1"
-                value={placeForm.floorCpmUsd}
-                onChange={(e) => {
-                  setPlaceForm({ ...placeForm, floorCpmUsd: Number(e.target.value) });
-                  clearPlaceError('floorCpmUsd');
-                }}
-                aria-invalid={Boolean(placeErrors.floorCpmUsd)}
-                aria-describedby={placeErrors.floorCpmUsd ? 'plc-floor-err' : undefined}
-                className={`w-full px-3 py-2 text-sm font-mono rounded-lg border ${fieldBorderClass(Boolean(placeErrors.floorCpmUsd))} bg-white dark:bg-slate-950`}
-              />
-              <FieldError id="plc-floor-err" message={placeErrors.floorCpmUsd} />
-            </div>
-            <button
-              type="submit"
-              className="w-full py-2 text-sm font-medium text-white bg-blue-700 hover:bg-blue-800 rounded-lg"
-            >
-              Generate Placement ID
-            </button>
-          </form>
+      {tab === 'placements' && (() => {
+        const draftPlacementSpec = getPlacementFormatSpec(placeForm.format);
+        const inspectedPlacement = inspectedPlacementId
+          ? placements.find((pl) => pl.id === inspectedPlacementId) ?? null
+          : null;
+        const activeSlotSource = inspectedPlacement
+          ? {
+              label: inspectedPlacement.name,
+              placementId: inspectedPlacement.id,
+              propertyName: inspectedPlacement.property_name,
+              format: inspectedPlacement.format,
+              dimensions: inspectedPlacement.dimensions,
+              floorCpmUsd: inspectedPlacement.floor_cpm_micros / 1_000_000,
+              isSaved: true,
+            }
+          : {
+              label: placeForm.name.trim() || 'Draft Ad Unit Slot',
+              placementId: 'draft_slot',
+              propertyName:
+                properties.find((p) => p.id === placeForm.propertyId)?.name || 'New Placement',
+              format: placeForm.format,
+              dimensions: placeForm.dimensions,
+              floorCpmUsd: Number.isFinite(Number(placeForm.floorCpmUsd)) ? Number(placeForm.floorCpmUsd) : 0.75,
+              isSaved: false,
+            };
+        const activeSlotSpec = getPlacementFormatSpec(activeSlotSource.format);
+        const activeCreativeFormat: AdFormat = activeSlotSpec.compatibleCreativeFormats.includes(
+          previewCreativeFormat
+        )
+          ? previewCreativeFormat
+          : activeSlotSpec.defaultCreativeFormat;
+        const sampleCreative = getSampleCreativeForFormat(activeCreativeFormat);
 
-          <div className="lg:col-span-8 min-w-0 border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden bg-white dark:bg-slate-900">
-            <div className="px-4 sm:px-5 py-3.5 border-b border-slate-200 dark:border-slate-800 text-sm font-semibold">
-              Ad Placements
-            </div>
-            <div className="overflow-x-auto">
-              <table className="w-full text-left text-xs">
-                <thead className="bg-slate-50 dark:bg-slate-950/50 text-slate-500 whitespace-nowrap">
-                  <tr>
-                    <th className="py-2.5 px-3 sm:px-4">Placement ID & Name</th>
-                    <th className="py-2.5 px-3 sm:px-4">Format</th>
-                    <th className="py-2.5 px-3 sm:px-4 text-right">Floor CPM</th>
-                    <th className="py-2.5 px-3 sm:px-4 text-right">Impr. / Clicks</th>
-                    <th className="py-2.5 px-3 sm:px-4 text-right">Status</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-200 dark:divide-slate-800 whitespace-nowrap">
-                  {placements.map((pl) => (
-                    <tr key={pl.id}>
-                      <td className="py-3 px-3 sm:px-4">
-                        <div className="font-medium text-slate-900 dark:text-white">{pl.name}</div>
-                        <div className="font-mono text-[11px] text-slate-500">
-                          {pl.id} · {pl.property_name}
-                        </div>
-                      </td>
-                      <td className="py-3 px-3 sm:px-4">
-                        {pl.format} · {pl.dimensions}
-                      </td>
-                      <td className="py-3 px-3 sm:px-4 text-right font-mono tabular-nums">
-                        {formatMicros(pl.floor_cpm_micros)}
-                      </td>
-                      <td className="py-3 px-3 sm:px-4 text-right font-mono tabular-nums">
-                        {formatNumber(pl.impressions)} / {formatNumber(pl.clicks)}
-                      </td>
-                      <td className="py-3 px-3 sm:px-4 text-right">
-                        <button
-                          type="button"
-                          onClick={() => handleTogglePlacement(pl.id, pl.status)}
-                          className="px-2.5 py-1 text-xs rounded-md border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 capitalize"
-                        >
-                          {pl.status}
-                        </button>
-                      </td>
-                    </tr>
+        return (
+          <div className="grid lg:grid-cols-12 gap-6 items-start">
+            <form
+              onSubmit={handleAddPlacement}
+              noValidate
+              className="lg:col-span-4 min-w-0 border border-slate-200 dark:border-slate-800 rounded-xl p-4 sm:p-5 bg-white dark:bg-slate-900 space-y-3.5"
+            >
+              <h2 className="text-base font-semibold">Create Ad Unit Placement</h2>
+              <div>
+                <label htmlFor="plc-prop" className="block text-xs font-medium mb-1">Property</label>
+                <select
+                  id="plc-prop"
+                  value={placeForm.propertyId}
+                  onChange={(e) => {
+                    setPlaceForm({ ...placeForm, propertyId: e.target.value });
+                    setInspectedPlacementId(null);
+                    clearPlaceError('propertyId');
+                  }}
+                  aria-invalid={Boolean(placeErrors.propertyId)}
+                  aria-describedby={placeErrors.propertyId ? 'plc-prop-err' : undefined}
+                  className={`w-full px-3 py-2 text-sm rounded-lg border ${fieldBorderClass(Boolean(placeErrors.propertyId))} bg-white dark:bg-slate-950`}
+                >
+                  {properties.length === 0 && <option value="">No registered properties</option>}
+                  {properties.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.name} ({p.domain_or_bundle})
+                    </option>
                   ))}
-                </tbody>
-              </table>
+                </select>
+                <FieldError id="plc-prop-err" message={placeErrors.propertyId} />
+              </div>
+              <div>
+                <label htmlFor="plc-name" className="block text-xs font-medium mb-1">Placement Name</label>
+                <input
+                  id="plc-name"
+                  type="text"
+                  required
+                  value={placeForm.name}
+                  onChange={(e) => {
+                    setPlaceForm({ ...placeForm, name: e.target.value });
+                    setInspectedPlacementId(null);
+                    clearPlaceError('name');
+                  }}
+                  aria-invalid={Boolean(placeErrors.name)}
+                  aria-describedby={placeErrors.name ? 'plc-name-err' : undefined}
+                  placeholder="Sidebar Native Unit"
+                  className={`w-full px-3 py-2 text-sm rounded-lg border ${fieldBorderClass(Boolean(placeErrors.name))} bg-white dark:bg-slate-950`}
+                />
+                <FieldError id="plc-name-err" message={placeErrors.name} />
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label htmlFor="plc-format" className="block text-xs font-medium mb-1">Format</label>
+                  <select
+                    id="plc-format"
+                    value={placeForm.format}
+                    onChange={(e) => {
+                      const nextForm = applyPlacementFormatChange(placeForm, e.target.value);
+                      const nextSpec = getPlacementFormatSpec(nextForm.format);
+                      setPlaceForm(nextForm);
+                      setInspectedPlacementId(null);
+                      if (!nextSpec.compatibleCreativeFormats.includes(previewCreativeFormat)) {
+                        setPreviewCreativeFormat(nextSpec.defaultCreativeFormat);
+                      }
+                      clearPlaceError('format');
+                      clearPlaceError('dimensions');
+                    }}
+                    className={`w-full px-3 py-2 text-sm rounded-lg border ${fieldBorderClass(Boolean(placeErrors.format))} bg-white dark:bg-slate-950`}
+                  >
+                    <option value="native">Native</option>
+                    <option value="banner">Display Banner</option>
+                    <option value="responsive">Responsive</option>
+                    <option value="in_feed">In-Feed</option>
+                    <option value="video">Video</option>
+                    <option value="interstitial">Interstitial</option>
+                  </select>
+                  <FieldError id="plc-format-err" message={placeErrors.format} />
+                </div>
+                <div>
+                  <label htmlFor="plc-dims" className="block text-xs font-medium mb-1">Dimensions</label>
+                  <input
+                    id="plc-dims"
+                    type="text"
+                    value={placeForm.dimensions}
+                    onChange={(e) => {
+                      setPlaceForm({ ...placeForm, dimensions: e.target.value });
+                      setInspectedPlacementId(null);
+                      clearPlaceError('dimensions');
+                    }}
+                    aria-invalid={Boolean(placeErrors.dimensions)}
+                    aria-describedby={placeErrors.dimensions ? 'plc-dims-err' : undefined}
+                    className={`w-full px-3 py-2 text-sm font-mono rounded-lg border ${fieldBorderClass(Boolean(placeErrors.dimensions))} bg-white dark:bg-slate-950`}
+                  />
+                  <FieldError id="plc-dims-err" message={placeErrors.dimensions} />
+                </div>
+              </div>
+              <div>
+                <div className="text-[11px] text-slate-500 dark:text-slate-400 mb-1.5">
+                  Recommended slot dimensions for {draftPlacementSpec.label}:
+                </div>
+                <div className="flex flex-wrap gap-1.5">
+                  {draftPlacementSpec.dimensionsOptions.map((opt) => (
+                    <button
+                      key={opt.value}
+                      type="button"
+                      onClick={() => {
+                        setPlaceForm({ ...placeForm, dimensions: opt.value });
+                        setInspectedPlacementId(null);
+                        clearPlaceError('dimensions');
+                      }}
+                      className={`px-2 py-1 text-[11px] font-mono rounded-md border transition-colors ${
+                        placeForm.dimensions === opt.value
+                          ? 'border-blue-700 bg-blue-50 dark:bg-blue-950/40 text-blue-700 dark:text-blue-300 font-semibold'
+                          : 'border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800'
+                      }`}
+                    >
+                      {opt.value}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div>
+                <label htmlFor="plc-floor" className="block text-xs font-medium mb-1">Floor CPM (USD)</label>
+                <input
+                  id="plc-floor"
+                  type="number"
+                  step="0.1"
+                  min="0.1"
+                  value={placeForm.floorCpmUsd}
+                  onChange={(e) => {
+                    setPlaceForm({ ...placeForm, floorCpmUsd: Number(e.target.value) });
+                    setInspectedPlacementId(null);
+                    clearPlaceError('floorCpmUsd');
+                  }}
+                  aria-invalid={Boolean(placeErrors.floorCpmUsd)}
+                  aria-describedby={placeErrors.floorCpmUsd ? 'plc-floor-err' : undefined}
+                  className={`w-full px-3 py-2 text-sm font-mono rounded-lg border ${fieldBorderClass(Boolean(placeErrors.floorCpmUsd))} bg-white dark:bg-slate-950`}
+                />
+                <FieldError id="plc-floor-err" message={placeErrors.floorCpmUsd} />
+              </div>
+              <button
+                type="submit"
+                className="w-full py-2 text-sm font-medium text-white bg-blue-700 hover:bg-blue-800 rounded-lg"
+              >
+                Generate Placement ID
+              </button>
+            </form>
+
+            <div className="lg:col-span-8 min-w-0 space-y-6">
+              {/* Interactive Ad Unit Preview */}
+              <div
+                className="border border-slate-200 dark:border-slate-800 rounded-xl p-4 sm:p-5 bg-white dark:bg-slate-900 space-y-4"
+                data-testid="publisher-slot-preview"
+              >
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <h3 className="text-sm font-semibold text-slate-900 dark:text-white">
+                        Interactive Ad Unit Slot Preview
+                      </h3>
+                      <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300">
+                        {activeSlotSource.isSaved ? activeSlotSource.placementId : 'Draft Slot'}
+                      </span>
+                    </div>
+                    <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
+                      <span className="font-medium text-slate-700 dark:text-slate-200">{activeSlotSource.label}</span>
+                      {' · '}
+                      {activeSlotSource.propertyName} · Floor ${activeSlotSource.floorCpmUsd.toFixed(2)} CPM ·{' '}
+                      {activeSlotSpec.label} ({activeSlotSource.dimensions || activeSlotSpec.defaultDimensions})
+                    </p>
+                  </div>
+                  {activeSlotSource.isSaved && (
+                    <button
+                      type="button"
+                      onClick={() => setInspectedPlacementId(null)}
+                      className="px-2.5 py-1 text-xs font-medium rounded-md border border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800 shrink-0"
+                    >
+                      Back to Draft
+                    </button>
+                  )}
+                </div>
+
+                <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
+                  <span className="text-xs text-slate-500 dark:text-slate-400">
+                    Simulate eligible creative format inside this {activeSlotSpec.label.toLowerCase()} slot:
+                  </span>
+                  <div className="flex flex-wrap gap-1.5" role="group" aria-label="Eligible creative formats">
+                    {activeSlotSpec.compatibleCreativeFormats.map((fmt) => (
+                      <button
+                        key={fmt}
+                        type="button"
+                        onClick={() => setPreviewCreativeFormat(fmt)}
+                        aria-pressed={activeCreativeFormat === fmt}
+                        className={`px-2.5 py-1 text-xs rounded-md border transition-colors ${
+                          activeCreativeFormat === fmt
+                            ? 'bg-blue-700 text-white border-blue-700 font-medium'
+                            : 'border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800'
+                        }`}
+                      >
+                        {AD_FORMAT_SPECS[fmt].label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <LiveAdPreview
+                  format={activeCreativeFormat}
+                  dimensions={activeSlotSource.dimensions || activeSlotSpec.defaultDimensions}
+                  pricingModel="CPM"
+                  title={sampleCreative.title}
+                  description={sampleCreative.description}
+                  mediaUrl={sampleCreative.mediaUrl}
+                  destinationUrl={sampleCreative.destinationUrl}
+                  ctaText={sampleCreative.ctaText}
+                  showCompatibilitySummary={false}
+                />
+              </div>
+
+              <div className="border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden bg-white dark:bg-slate-900">
+                <div className="px-4 sm:px-5 py-3.5 border-b border-slate-200 dark:border-slate-800 text-sm font-semibold">
+                  Ad Placements
+                </div>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left text-xs">
+                    <thead className="bg-slate-50 dark:bg-slate-950/50 text-slate-500 whitespace-nowrap">
+                      <tr>
+                        <th className="py-2.5 px-3 sm:px-4">Placement ID & Name</th>
+                        <th className="py-2.5 px-3 sm:px-4">Format</th>
+                        <th className="py-2.5 px-3 sm:px-4 text-right">Floor CPM</th>
+                        <th className="py-2.5 px-3 sm:px-4 text-right">Impr. / Clicks</th>
+                        <th className="py-2.5 px-3 sm:px-4 text-right">Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-200 dark:divide-slate-800">
+                      {placements.map((pl) => {
+                        const isPreviewing = inspectedPlacementId === pl.id;
+                        return (
+                          <tr
+                            key={pl.id}
+                            className={isPreviewing ? 'bg-blue-50/50 dark:bg-blue-950/20' : undefined}
+                          >
+                            <td className="py-3 px-3 sm:px-4 min-w-[160px]">
+                              <div className="font-medium text-slate-900 dark:text-white">{pl.name}</div>
+                              <div className="font-mono text-[11px] text-slate-500 break-words">
+                                {pl.id} · {pl.property_name}
+                              </div>
+                            </td>
+                            <td className="py-3 px-3 sm:px-4 whitespace-nowrap">
+                              {pl.format} · {pl.dimensions}
+                            </td>
+                            <td className="py-3 px-3 sm:px-4 text-right font-mono tabular-nums whitespace-nowrap">
+                              {formatMicros(pl.floor_cpm_micros)}
+                            </td>
+                            <td className="py-3 px-3 sm:px-4 text-right font-mono tabular-nums whitespace-nowrap">
+                              {formatNumber(pl.impressions)} / {formatNumber(pl.clicks)}
+                            </td>
+                            <td className="py-3 px-3 sm:px-4 text-right whitespace-nowrap">
+                              <div className="inline-flex items-center gap-1.5">
+                                <button
+                                  type="button"
+                                  aria-pressed={isPreviewing}
+                                  onClick={() => {
+                                    setInspectedPlacementId(pl.id);
+                                    const spec = getPlacementFormatSpec(pl.format);
+                                    setPreviewCreativeFormat(spec.defaultCreativeFormat);
+                                  }}
+                                  className={`inline-flex items-center gap-1 px-2.5 py-1 text-xs rounded-md border ${
+                                    isPreviewing
+                                      ? 'border-blue-700 bg-blue-700 text-white'
+                                      : 'border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800'
+                                  }`}
+                                >
+                                  <Eye className="w-3 h-3" />
+                                  <span>Preview</span>
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => handleTogglePlacement(pl.id, pl.status)}
+                                  className="px-2.5 py-1 text-xs rounded-md border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 capitalize"
+                                >
+                                  {pl.status}
+                                </button>
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
             </div>
           </div>
-        </div>
-      )}
+        );
+      })()}
 
       {/* TAB: INTEGRATION CENTER */}
       {tab === 'integration' && (
@@ -1185,18 +1363,16 @@ let ad = try await client.requestAd(
                       eCPM: {formatMicros(sandboxResult.auction?.effectiveCpmMicros)} · Model: {sandboxResult.ad.pricingModel}
                     </span>
                   </div>
-                  {sandboxResult.ad.mediaUrl && (
-                    <img
-                      src={sandboxResult.ad.mediaUrl}
-                      alt={sandboxResult.ad.title}
-                      referrerPolicy="no-referrer"
-                      className="w-full h-40 object-cover rounded-md"
-                    />
-                  )}
-                  <div>
-                    <div className="font-semibold text-sm text-slate-900 dark:text-white">{sandboxResult.ad.title}</div>
-                    <p className="text-xs text-slate-600 dark:text-slate-300 mt-1">{sandboxResult.ad.description}</p>
-                  </div>
+                  <LiveAdPreview
+                    format={sandboxResult.ad.format}
+                    dimensions={sandboxResult.ad.dimensions || 'responsive'}
+                    pricingModel={sandboxResult.ad.pricingModel}
+                    title={sandboxResult.ad.title}
+                    description={sandboxResult.ad.description}
+                    mediaUrl={sandboxResult.ad.mediaUrl}
+                    destinationUrl={sandboxResult.ad.destinationUrl}
+                    ctaText={sandboxResult.ad.ctaText || ''}
+                  />
                   <div className="flex flex-wrap gap-2 pt-1">
                     <button
                       type="button"
@@ -1311,29 +1487,36 @@ let ad = try await client.requestAd(
                   </span>
                 </div>
 
-                <div className="grid sm:grid-cols-3 gap-3 text-xs">
-                  <div className="p-3 rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-950">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 items-start text-xs">
+                  <div className="p-3.5 rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-950">
                     <div className="text-[11px] font-mono text-slate-400">Organic Looma Post #1</div>
                     <div className="font-semibold text-slate-900 dark:text-white mt-1">Community Update</div>
-                    <p className="text-slate-600 dark:text-slate-300 mt-1">
+                    <p className="text-slate-600 dark:text-slate-300 mt-1 leading-relaxed">
                       Looma always renders organic feed posts even when LOOMA ADS is degraded or unreachable.
                     </p>
                   </div>
                   {loomaFeedResult.decisions.map((dec) => (
                     <div
                       key={`${dec.slotIndex}-${dec.placementId}`}
-                      className="p-3 rounded-lg border border-blue-200 dark:border-blue-900/60 bg-blue-50/40 dark:bg-blue-950/20 min-w-0"
+                      className="p-3.5 rounded-lg border border-blue-200 dark:border-blue-900/60 bg-blue-50/40 dark:bg-blue-950/20 min-w-0 space-y-2.5"
                     >
                       <div className="text-[11px] font-mono text-blue-700 dark:text-blue-300 truncate">
                         Slot #{dec.slotIndex} · {dec.placementId}
                       </div>
                       {dec.filled && dec.ad ? (
                         <>
-                          <div className="font-semibold text-slate-900 dark:text-white mt-1 truncate">{dec.ad.title}</div>
-                          <div className="text-[11px] text-slate-600 dark:text-slate-300 mt-0.5 line-clamp-2">
-                            {dec.ad.description}
-                          </div>
-                          <div className="text-[10px] font-mono text-slate-500 mt-2 break-all">
+                          <LiveAdPreview
+                            format={dec.ad.format}
+                            dimensions={dec.ad.dimensions || 'responsive'}
+                            pricingModel={dec.ad.pricingModel}
+                            title={dec.ad.title}
+                            description={dec.ad.description}
+                            mediaUrl={dec.ad.mediaUrl}
+                            destinationUrl={dec.ad.destinationUrl}
+                            ctaText={dec.ad.ctaText || ''}
+                            showCompatibilitySummary={false}
+                          />
+                          <div className="text-[10px] font-mono text-slate-500 break-all">
                             Hold: {dec.reservationId} ({formatMicros(dec.reservedMicros)}) · Rot: {dec.auction?.rotationFactor}x
                           </div>
                         </>

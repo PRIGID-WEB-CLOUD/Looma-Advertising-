@@ -1,7 +1,6 @@
 import crypto from 'node:crypto';
-import type { DatabaseSync } from 'node:sqlite';
-import { hashIp, hashPassword, signSessionToken, TRACKING_SECRET } from '../auth';
-import { withTransaction } from '../db';
+import { getTrackingSecret, hashIp, hashPassword, signSessionToken } from '../auth';
+import { type DbClient, withTransaction } from '../db/postgres';
 import {
   CandidateCampaign,
   CreativeFormat,
@@ -10,11 +9,10 @@ import {
   selectWinningAds,
   signTrackingToken,
 } from '../engine';
-import { reserveBudgetForRequest } from './budgetReservations';
+import { reserveBudgetForRequest, type ReserveBudgetResult } from './budgetReservations';
 import { isPublisherEligibleForDelivery } from './featureFlags';
 
-const LOOMA_SSO_SECRET = process.env.LOOMA_SSO_SHARED_SECRET || crypto.randomBytes(32).toString('hex');
-const LOOMA_ADAPTER_KEY = process.env.LOOMA_ADAPTER_KEY || '';
+let fallbackLoomaSsoSecret: string | null = null;
 
 export type LoomaMembershipRole = 'owner' | 'admin' | 'ad_manager' | 'viewer';
 
@@ -77,11 +75,16 @@ export interface LoomaFeedAdDecision {
 }
 
 export function getLoomaSsoSecret(): string {
-  return process.env.LOOMA_SSO_SHARED_SECRET || LOOMA_SSO_SECRET;
+  const configured = process.env.LOOMA_SSO_SHARED_SECRET?.trim();
+  if (configured) return configured;
+  if (!fallbackLoomaSsoSecret) {
+    fallbackLoomaSsoSecret = crypto.randomBytes(32).toString('hex');
+  }
+  return fallbackLoomaSsoSecret;
 }
 
 export function verifyLoomaAdapterAuth(providedKey: string | undefined): boolean {
-  const configured = (process.env.LOOMA_ADAPTER_KEY || LOOMA_ADAPTER_KEY || '').trim();
+  const configured = (process.env.LOOMA_ADAPTER_KEY || '').trim();
   if (!configured || !providedKey) {
     return false;
   }
@@ -90,11 +93,6 @@ export function verifyLoomaAdapterAuth(providedKey: string | undefined): boolean
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
-/**
- * Creates a cryptographically signed Looma SSO + business membership assertion.
- * Used by Looma Core (and in sandbox testing / automated tests) to authenticate
- * users into LOOMA ADS without duplicating Looma accounts or business profiles.
- */
 export function signLoomaSsoAssertion(
   payload: Omit<LoomaSsoAssertionPayload, 'iss' | 'aud' | 'jti' | 'iat' | 'exp'> & {
     jti?: string;
@@ -166,16 +164,11 @@ export function verifyLoomaSsoAssertion(
   return { valid: true, payload: parsed };
 }
 
-/**
- * Exchanges a verified Looma SSO assertion for a LOOMA ADS session token.
- * Links external Looma user & business IDs via looma_identity_links without
- * duplicating Looma's canonical account or business profile tables.
- */
-export function exchangeLoomaSsoSession(
-  db: DatabaseSync,
+export async function exchangeLoomaSsoSession(
+  db: DbClient,
   assertionToken: string,
   secret = getLoomaSsoSecret()
-):
+): Promise<
   | {
       ok: true;
       token: string;
@@ -187,7 +180,8 @@ export function exchangeLoomaSsoSession(
         advertiserId: string;
       };
     }
-  | { ok: false; status: number; error: string } {
+  | { ok: false; status: number; error: string }
+> {
   const verified = verifyLoomaSsoAssertion(assertionToken, secret);
   if (!verified.valid) {
     const status =
@@ -200,41 +194,44 @@ export function exchangeLoomaSsoSession(
 
   const claims = verified.payload;
 
-  return withTransaction(db, () => {
-    // Enforce single-use replay protection on jti nonce
-    const replayed = db
-      .prepare('SELECT jti FROM looma_sso_nonces WHERE jti = ?')
-      .get(claims.jti);
+  return withTransaction(db, async (tx) => {
+    const replayed = await tx.queryOne('SELECT jti FROM looma_sso_nonces WHERE jti = ?', [claims.jti]);
     if (replayed) {
       return { ok: false as const, status: 401, error: 'sso_assertion_replayed' };
     }
 
-    db.prepare(
+    const expIso = new Date(claims.exp * 1000).toISOString();
+    await tx.execute(
       `INSERT INTO looma_sso_nonces (jti, looma_user_id, expires_at)
-       VALUES (?, ?, datetime(?, 'unixepoch'))`
-    ).run(claims.jti, claims.loomaUserId, claims.exp);
+       VALUES (?, ?, ?)`,
+      [claims.jti, claims.loomaUserId, expIso]
+    );
 
-    // Check existing identity link first so Looma profiles are never duplicated
-    const existingLink = db
-      .prepare(
-        `SELECT l.id, l.user_id, l.advertiser_id, u.email, u.full_name, u.status
-         FROM looma_identity_links l
-         JOIN users u ON u.id = l.user_id
-         WHERE l.looma_user_id = ? AND l.looma_business_id = ?`
-      )
-      .get(claims.loomaUserId, claims.businessId) as
-      | { id: string; user_id: string; advertiser_id: string; email: string; full_name: string; status: string }
-      | undefined;
+    const existingLink = await tx.queryOne<{
+      id: string;
+      user_id: string;
+      advertiser_id: string;
+      email: string;
+      full_name: string;
+      status: string;
+    }>(
+      `SELECT l.id, l.user_id, l.advertiser_id, u.email, u.full_name, u.status
+       FROM looma_identity_links l
+       JOIN users u ON u.id = l.user_id
+       WHERE l.looma_user_id = ? AND l.looma_business_id = ?`,
+      [claims.loomaUserId, claims.businessId]
+    );
 
     if (existingLink) {
       if (existingLink.status !== 'active') {
         return { ok: false as const, status: 403, error: 'linked_account_suspended' };
       }
-      db.prepare(
+      await tx.execute(
         `UPDATE looma_identity_links
-         SET membership_role = ?, last_verified_at = datetime('now')
-         WHERE id = ?`
-      ).run(claims.membershipRole, existingLink.id);
+         SET membership_role = ?, last_verified_at = ?
+         WHERE id = ?`,
+        [claims.membershipRole, new Date().toISOString(), existingLink.id]
+      );
 
       const token = signSessionToken({
         userId: existingLink.user_id,
@@ -259,10 +256,13 @@ export function exchangeLoomaSsoSession(
       };
     }
 
-    // Link to an existing advertiser user matching email or provision lightweight linked wallet record
-    let userRow = db
-      .prepare('SELECT id, email, full_name, status, role_id FROM users WHERE email = ?')
-      .get(claims.email) as { id: string; email: string; full_name: string; status: string; role_id: string } | undefined;
+    const userRow = await tx.queryOne<{
+      id: string;
+      email: string;
+      full_name: string;
+      status: string;
+      role_id: string;
+    }>('SELECT id, email, full_name, status, role_id FROM users WHERE email = ?', [claims.email]);
 
     let userId: string;
     let advertiserId: string;
@@ -275,45 +275,52 @@ export function exchangeLoomaSsoSession(
         return { ok: false as const, status: 403, error: 'linked_account_suspended' };
       }
       userId = userRow.id;
-      const existingAdv = db
-        .prepare('SELECT id FROM advertiser_accounts WHERE user_id = ?')
-        .get(userId) as { id: string } | undefined;
+      const existingAdv = await tx.queryOne<{ id: string }>(
+        'SELECT id FROM advertiser_accounts WHERE user_id = ?',
+        [userId]
+      );
       if (existingAdv) {
         advertiserId = existingAdv.id;
       } else {
         advertiserId = `adv_${crypto.randomUUID().slice(0, 10)}`;
-        db.prepare(
+        await tx.execute(
           `INSERT INTO advertiser_accounts (id, user_id, company_name, country, currency, verification_status, account_status, billing_email)
-           VALUES (?, ?, ?, ?, 'USD', 'verified', 'active', ?)`
-        ).run(advertiserId, userId, claims.businessName, claims.country || 'US', claims.email);
-        db.prepare(
+           VALUES (?, ?, ?, ?, 'USD', 'verified', 'active', ?)`,
+          [advertiserId, userId, claims.businessName, claims.country || 'US', claims.email]
+        );
+        await tx.execute(
           `INSERT INTO advertiser_wallets (id, advertiser_id, available_micros, reserved_micros, lifetime_deposited_micros, lifetime_spent_micros, currency)
-           VALUES (?, ?, 0, 0, 0, 0, 'USD')`
-        ).run(`wal_${crypto.randomUUID().slice(0, 10)}`, advertiserId);
+           VALUES (?, ?, 0, 0, 0, 0, 'USD')`,
+          [`wal_${crypto.randomUUID().slice(0, 10)}`, advertiserId]
+        );
       }
     } else {
       userId = `usr_sso_${crypto.randomUUID().slice(0, 10)}`;
       advertiserId = `adv_${crypto.randomUUID().slice(0, 10)}`;
-      db.prepare(
+      await tx.execute(
         `INSERT INTO users (id, email, full_name, password_hash, role_id, status, email_verified)
-         VALUES (?, ?, ?, ?, 'role_advertiser', 'active', 1)`
-      ).run(userId, claims.email, claims.fullName, hashPassword(crypto.randomBytes(24).toString('hex')));
+         VALUES (?, ?, ?, ?, 'role_advertiser', 'active', 1)`,
+        [userId, claims.email, claims.fullName, hashPassword(crypto.randomBytes(24).toString('hex'))]
+      );
 
-      db.prepare(
+      await tx.execute(
         `INSERT INTO advertiser_accounts (id, user_id, company_name, country, currency, verification_status, account_status, billing_email)
-         VALUES (?, ?, ?, ?, 'USD', 'verified', 'active', ?)`
-      ).run(advertiserId, userId, claims.businessName, claims.country || 'US', claims.email);
+         VALUES (?, ?, ?, ?, 'USD', 'verified', 'active', ?)`,
+        [advertiserId, userId, claims.businessName, claims.country || 'US', claims.email]
+      );
 
-      db.prepare(
+      await tx.execute(
         `INSERT INTO advertiser_wallets (id, advertiser_id, available_micros, reserved_micros, lifetime_deposited_micros, lifetime_spent_micros, currency)
-         VALUES (?, ?, 0, 0, 0, 0, 'USD')`
-      ).run(`wal_${crypto.randomUUID().slice(0, 10)}`, advertiserId);
+         VALUES (?, ?, 0, 0, 0, 0, 'USD')`,
+        [`wal_${crypto.randomUUID().slice(0, 10)}`, advertiserId]
+      );
     }
 
-    db.prepare(
+    await tx.execute(
       `INSERT INTO looma_identity_links (id, looma_user_id, looma_business_id, membership_role, user_id, advertiser_id)
-       VALUES (?, ?, ?, ?, ?, ?)`
-    ).run(`lnk_${crypto.randomUUID().slice(0, 10)}`, claims.loomaUserId, claims.businessId, claims.membershipRole, userId, advertiserId);
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [`lnk_${crypto.randomUUID().slice(0, 10)}`, claims.loomaUserId, claims.businessId, claims.membershipRole, userId, advertiserId]
+    );
 
     const token = signSessionToken({ userId, email: claims.email, role: 'advertiser' });
     return {
@@ -344,14 +351,8 @@ function parseJsonArray(raw: string, fallback: string[]): string[] {
   }
 }
 
-/**
- * Looma First-Party Feed Ad Selection Contract.
- * Looma controls feed rendering while LOOMA ADS performs eligibility filtering,
- * first-price bidding with controlled rotation, frequency capping, and atomic
- * prepaid budget reservations for each returned slot.
- */
-export function selectLoomaFeedAds(
-  db: DatabaseSync,
+export async function selectLoomaFeedAds(
+  db: DbClient,
   params: {
     slots: LoomaFeedSlotRequest[];
     country: string;
@@ -365,41 +366,39 @@ export function selectLoomaFeedAds(
     clientIp: string;
     userAgent: string;
   }
-): {
+): Promise<{
   contractVersion: string;
   publisherMode: 'first_party_adapter';
   fallbackBehavior: 'skip_slot_continue_feed';
   decisions: LoomaFeedAdDecision[];
-} {
+}> {
   const ipHash = hashIp(params.clientIp);
   const sessionHash = hashIp(params.sessionId || `${params.clientIp}:${params.userAgent}`);
+  const twoHoursAgoIso = new Date(Date.now() - 2 * 3600_000).toISOString();
+  const oneHourAgoIso = new Date(Date.now() - 3600_000).toISOString();
 
-  // Count session impressions per campaign in last 2 hours for frequency capping & rotation
-  const freqRows = db
-    .prepare(
-      `SELECT campaign_id, COUNT(*) AS cnt
-       FROM impressions
-       WHERE session_hash = ? AND created_at >= datetime('now', '-2 hours')
-       GROUP BY campaign_id`
-    )
-    .all(sessionHash) as Array<{ campaign_id: string; cnt: number }>;
+  const freqRows = await db.query<{ campaign_id: string; cnt: number }>(
+    `SELECT campaign_id, COUNT(*) AS cnt
+     FROM impressions
+     WHERE session_hash = ? AND created_at >= ?
+     GROUP BY campaign_id`,
+    [sessionHash, twoHoursAgoIso]
+  );
   const sessionImpressionCounts: Record<string, number> = {};
   for (const row of freqRows) {
-    sessionImpressionCounts[row.campaign_id] = row.cnt;
+    sessionImpressionCounts[row.campaign_id] = Number(row.cnt);
   }
 
-  // Recent global impressions per campaign (last 1 hour) for controlled rotation balancing
-  const recentRows = db
-    .prepare(
-      `SELECT campaign_id, COUNT(*) AS cnt
-       FROM impressions
-       WHERE created_at >= datetime('now', '-1 hour')
-       GROUP BY campaign_id`
-    )
-    .all() as Array<{ campaign_id: string; cnt: number }>;
+  const recentRows = await db.query<{ campaign_id: string; cnt: number }>(
+    `SELECT campaign_id, COUNT(*) AS cnt
+     FROM impressions
+     WHERE created_at >= ?
+     GROUP BY campaign_id`,
+    [oneHourAgoIso]
+  );
   const recentDeliveryCounts: Record<string, number> = {};
   for (const row of recentRows) {
-    recentDeliveryCounts[row.campaign_id] = row.cnt;
+    recentDeliveryCounts[row.campaign_id] = Number(row.cnt);
   }
 
   const boundedSlots = params.slots.slice(0, 10);
@@ -407,30 +406,27 @@ export function selectLoomaFeedAds(
   const decisions: LoomaFeedAdDecision[] = [];
 
   for (const slot of boundedSlots) {
-    const placement = db
-      .prepare(
-        `SELECT p.id, p.property_id, p.publisher_id, p.format, p.dimensions, p.floor_cpm_micros, p.status,
-                prop.approval_status AS property_approval,
-                pub.approval_status AS publisher_approval, pub.publisher_type
-         FROM ad_placements p
-         JOIN publisher_properties prop ON prop.id = p.property_id
-         JOIN publisher_accounts pub ON pub.id = p.publisher_id
-         WHERE p.id = ?`
-      )
-      .get(slot.placementId) as
-      | {
-          id: string;
-          property_id: string;
-          publisher_id: string;
-          format: PlacementFormat;
-          dimensions: string;
-          floor_cpm_micros: number;
-          status: string;
-          property_approval: string;
-          publisher_approval: string;
-          publisher_type: string;
-        }
-      | undefined;
+    const placement = await db.queryOne<{
+      id: string;
+      property_id: string;
+      publisher_id: string;
+      format: PlacementFormat;
+      dimensions: string;
+      floor_cpm_micros: number;
+      status: string;
+      property_approval: string;
+      publisher_approval: string;
+      publisher_type: string;
+    }>(
+      `SELECT p.id, p.property_id, p.publisher_id, p.format, p.dimensions, p.floor_cpm_micros, p.status,
+              prop.approval_status AS property_approval,
+              pub.approval_status AS publisher_approval, pub.publisher_type
+       FROM ad_placements p
+       JOIN publisher_properties prop ON prop.id = p.property_id
+       JOIN publisher_accounts pub ON pub.id = p.publisher_id
+       WHERE p.id = ?`,
+      [slot.placementId]
+    );
 
     if (!placement) {
       decisions.push({
@@ -444,7 +440,7 @@ export function selectLoomaFeedAds(
       continue;
     }
 
-    const pubEligibility = isPublisherEligibleForDelivery(
+    const pubEligibility = await isPublisherEligibleForDelivery(
       db,
       placement.publisher_type || 'first_party',
       placement.publisher_approval
@@ -461,30 +457,27 @@ export function selectLoomaFeedAds(
       continue;
     }
 
-    // Re-query fresh wallet & budget headroom per slot so earlier slot reservations are reflected immediately
-    const rows = db
-      .prepare(
-        `SELECT c.id AS campaign_id, c.advertiser_id, c.name AS campaign_name, c.pricing_model,
-                c.bidding_strategy, c.status, c.moderation_status, c.start_date, c.end_date,
-                c.frequency_cap_per_session,
-                b.daily_budget_micros, b.total_budget_micros, b.spent_today_micros, b.spent_total_micros,
-                b.max_bid_micros, b.pacing_mode,
-                w.available_micros AS wallet_available_micros,
-                t.countries_json, t.languages_json, t.device_categories_json, t.operating_systems_json,
-                t.browsers_json, t.contextual_categories_json, t.consent_required,
-                adv.format AS creative_format, crt.id AS creative_id, crt.advertisement_id,
-                crt.title, crt.description, crt.media_url, crt.destination_url, crt.cta_text,
-                crt.tracking_params, crt.dimensions, crt.approval_status AS creative_approval_status
-         FROM campaigns c
-         JOIN advertiser_accounts adv_acc ON adv_acc.id = c.advertiser_id
-         JOIN advertiser_wallets w ON w.advertiser_id = c.advertiser_id
-         JOIN campaign_budgets b ON b.campaign_id = c.id
-         JOIN campaign_targeting t ON t.campaign_id = c.id
-         JOIN advertisements adv ON adv.campaign_id = c.id AND adv.status = 'active'
-         JOIN ad_creatives crt ON crt.advertisement_id = adv.id
-         WHERE c.status = 'active' AND c.moderation_status = 'approved' AND adv_acc.account_status = 'active'`
-      )
-      .all() as Array<Record<string, any>>;
+    const rows = await db.query<Record<string, any>>(
+      `SELECT c.id AS campaign_id, c.advertiser_id, c.name AS campaign_name, c.pricing_model,
+              c.bidding_strategy, c.status, c.moderation_status, c.start_date, c.end_date,
+              c.frequency_cap_per_session,
+              b.daily_budget_micros, b.total_budget_micros, b.spent_today_micros, b.spent_total_micros,
+              b.max_bid_micros, b.pacing_mode,
+              w.available_micros AS wallet_available_micros,
+              t.countries_json, t.languages_json, t.device_categories_json, t.operating_systems_json,
+              t.browsers_json, t.contextual_categories_json, t.consent_required,
+              adv.format AS creative_format, crt.id AS creative_id, crt.advertisement_id,
+              crt.title, crt.description, crt.media_url, crt.destination_url, crt.cta_text,
+              crt.tracking_params, crt.dimensions, crt.approval_status AS creative_approval_status
+       FROM campaigns c
+       JOIN advertiser_accounts adv_acc ON adv_acc.id = c.advertiser_id
+       JOIN advertiser_wallets w ON w.advertiser_id = c.advertiser_id
+       JOIN campaign_budgets b ON b.campaign_id = c.id
+       JOIN campaign_targeting t ON t.campaign_id = c.id
+       JOIN advertisements adv ON adv.campaign_id = c.id AND adv.status = 'active'
+       JOIN ad_creatives crt ON crt.advertisement_id = adv.id
+       WHERE c.status = 'active' AND c.moderation_status = 'approved' AND adv_acc.account_status = 'active'`
+    );
 
     const candidates: CandidateCampaign[] = rows
       .filter((r) => !excludedCampaignIds.has(r.campaign_id))
@@ -498,14 +491,14 @@ export function selectLoomaFeedAds(
         moderationStatus: r.moderation_status,
         startDate: r.start_date,
         endDate: r.end_date,
-        frequencyCapPerSession: r.frequency_cap_per_session,
-        dailyBudgetMicros: r.daily_budget_micros,
-        totalBudgetMicros: r.total_budget_micros,
-        spentTodayMicros: r.spent_today_micros,
-        spentTotalMicros: r.spent_total_micros,
-        maxBidMicros: r.max_bid_micros,
+        frequencyCapPerSession: Number(r.frequency_cap_per_session),
+        dailyBudgetMicros: Number(r.daily_budget_micros),
+        totalBudgetMicros: Number(r.total_budget_micros),
+        spentTodayMicros: Number(r.spent_today_micros),
+        spentTotalMicros: Number(r.spent_total_micros),
+        maxBidMicros: Number(r.max_bid_micros),
         pacingMode: r.pacing_mode,
-        walletAvailableMicros: r.wallet_available_micros,
+        walletAvailableMicros: Number(r.wallet_available_micros),
         targeting: {
           countries: parseJsonArray(r.countries_json, ['ALL']),
           languages: parseJsonArray(r.languages_json, ['ALL']),
@@ -538,7 +531,7 @@ export function selectLoomaFeedAds(
       {
         placementId: placement.id,
         placementFormat: placement.format,
-        floorCpmMicros: placement.floor_cpm_micros,
+        floorCpmMicros: Number(placement.floor_cpm_micros),
         country: params.country,
         language: params.language,
         deviceCategory: params.deviceCategory,
@@ -556,9 +549,9 @@ export function selectLoomaFeedAds(
     const requestId = `req_${crypto.randomUUID().slice(0, 12)}`;
     const winner = winners[0] ?? null;
 
-    let reservation: ReturnType<typeof reserveBudgetForRequest> | null = null;
+    let reservation: ReserveBudgetResult | null = null;
     if (winner) {
-      reservation = reserveBudgetForRequest(db, {
+      reservation = await reserveBudgetForRequest(db, {
         advertiserId: winner.candidate.advertiserId,
         campaignId: winner.candidate.campaignId,
         requestId,
@@ -569,27 +562,28 @@ export function selectLoomaFeedAds(
 
     const actuallyFilled = Boolean(winner && reservation?.reserved);
 
-    db.prepare(
+    await db.execute(
       `INSERT INTO ad_requests
          (id, placement_id, property_id, publisher_id, winning_campaign_id, winning_creative_id, country, device_category, os, browser, language, category, consent_granted, filled, ip_hash, session_hash)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    ).run(
-      requestId,
-      placement.id,
-      placement.property_id,
-      placement.publisher_id,
-      actuallyFilled && winner ? winner.candidate.campaignId : null,
-      actuallyFilled && winner ? winner.candidate.creative.id : null,
-      params.country,
-      params.deviceCategory,
-      params.os,
-      params.browser,
-      params.language,
-      params.feedCategory,
-      params.consentGranted ? 1 : 0,
-      actuallyFilled ? 1 : 0,
-      ipHash,
-      sessionHash
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        requestId,
+        placement.id,
+        placement.property_id,
+        placement.publisher_id,
+        actuallyFilled && winner ? winner.candidate.campaignId : null,
+        actuallyFilled && winner ? winner.candidate.creative.id : null,
+        params.country,
+        params.deviceCategory,
+        params.os,
+        params.browser,
+        params.language,
+        params.feedCategory,
+        params.consentGranted ? 1 : 0,
+        actuallyFilled ? 1 : 0,
+        ipHash,
+        sessionHash,
+      ]
     );
 
     if (!actuallyFilled || !winner) {
@@ -604,7 +598,6 @@ export function selectLoomaFeedAds(
       continue;
     }
 
-    // Prevent the same campaign from dominating consecutive feed slots
     excludedCampaignIds.add(winner.candidate.campaignId);
     sessionImpressionCounts[winner.candidate.campaignId] =
       (sessionImpressionCounts[winner.candidate.campaignId] ?? 0) + 1;
@@ -655,11 +648,11 @@ export function selectLoomaFeedAds(
         sponsoredLabel: 'Sponsored · Looma Ads',
       },
       tracking: {
-        impressionToken: signTrackingToken({ ...baseToken, eventType: 'impression' }, TRACKING_SECRET),
-        clickToken: signTrackingToken({ ...baseToken, eventType: 'click' }, TRACKING_SECRET),
-        conversionToken: signTrackingToken({ ...baseToken, eventType: 'conversion' }, TRACKING_SECRET),
-        videoToken: signTrackingToken({ ...baseToken, eventType: 'video' }, TRACKING_SECRET),
-        installToken: signTrackingToken({ ...baseToken, eventType: 'install' }, TRACKING_SECRET),
+        impressionToken: signTrackingToken({ ...baseToken, eventType: 'impression' }, getTrackingSecret()),
+        clickToken: signTrackingToken({ ...baseToken, eventType: 'click' }, getTrackingSecret()),
+        conversionToken: signTrackingToken({ ...baseToken, eventType: 'conversion' }, getTrackingSecret()),
+        videoToken: signTrackingToken({ ...baseToken, eventType: 'video' }, getTrackingSecret()),
+        installToken: signTrackingToken({ ...baseToken, eventType: 'install' }, getTrackingSecret()),
       },
     });
   }

@@ -1,8 +1,7 @@
 import crypto from 'node:crypto';
-import { Router, type Response } from 'express';
-import type { DatabaseSync } from 'node:sqlite';
+import { createAppRouter, type AppRouter, type Response } from '../http/router';
 import { AuthenticatedRequest, createAuthMiddleware, requireRole } from '../auth';
-import { withTransaction } from '../db';
+import { withTransaction, type DbClient } from '../db/postgres';
 import { verifyDomainOwnershipLive } from '../security';
 import { getFeatureFlags } from '../modules/featureFlags';
 import {
@@ -16,104 +15,128 @@ import {
   validateWithdrawalInput,
 } from '../../src/lib/validation';
 
-export function createPublisherRouter(db: DatabaseSync): Router {
-  const router = Router();
+export function createPublisherRouter(db: DbClient): AppRouter {
+  const router = createAppRouter();
   const requireAuth = createAuthMiddleware(db);
   router.use(requireAuth, requireRole('publisher', 'admin'));
 
-  function resolvePublisherId(req: AuthenticatedRequest): string | null {
+  async function resolvePublisherId(req: AuthenticatedRequest): Promise<string | null> {
     if (req.auth?.role === 'admin' && typeof req.query.publisherId === 'string') {
       return req.query.publisherId;
     }
-    const row = db
-      .prepare('SELECT id FROM publisher_accounts WHERE user_id = ?')
-      .get(req.auth!.userId) as { id: string } | undefined;
+    const row = await db.queryOne<{ id: string }>(
+      'SELECT id FROM publisher_accounts WHERE user_id = ?',
+      [req.auth!.userId]
+    );
     return row?.id ?? null;
   }
 
+  function parseSettingNumber(raw: string | undefined, fallback: number): number {
+    if (!raw) return fallback;
+    try {
+      const parsed = Number(JSON.parse(raw));
+      return Number.isFinite(parsed) ? parsed : fallback;
+    } catch {
+      return fallback;
+    }
+  }
+
   // GET /api/publisher/overview
-  router.get('/overview', (req: AuthenticatedRequest, res: Response) => {
-    const publisherId = resolvePublisherId(req);
+  router.get('/overview', async (req: AuthenticatedRequest, res: Response) => {
+    const publisherId = await resolvePublisherId(req);
     if (!publisherId) {
       res.status(404).json({ error: 'Publisher account not found' });
       return;
     }
 
-    const account = db.prepare('SELECT * FROM publisher_accounts WHERE id = ?').get(publisherId);
-    const wallet = db.prepare('SELECT * FROM publisher_wallets WHERE publisher_id = ?').get(publisherId);
-    const settingRow = db
-      .prepare("SELECT value_json FROM platform_settings WHERE key = 'default_publisher_share_bps'")
-      .get() as { value_json: string } | undefined;
-    const defaultBps = settingRow ? Number(JSON.parse(settingRow.value_json)) : 7000;
+    const account = await db.queryOne('SELECT * FROM publisher_accounts WHERE id = ?', [publisherId]);
+    const wallet = await db.queryOne('SELECT * FROM publisher_wallets WHERE publisher_id = ?', [publisherId]);
+    const settingRow = await db.queryOne<{ value_json: string }>(
+      "SELECT value_json FROM platform_settings WHERE key = 'default_publisher_share_bps'"
+    );
+    const defaultBps = parseSettingNumber(settingRow?.value_json, 7000);
 
-    const minPayoutRow = db
-      .prepare("SELECT value_json FROM platform_settings WHERE key = 'minimum_publisher_payout_micros'")
-      .get() as { value_json: string } | undefined;
-    const minPayoutMicros = minPayoutRow ? Number(JSON.parse(minPayoutRow.value_json)) : 50_000_000;
+    const minPayoutRow = await db.queryOne<{ value_json: string }>(
+      "SELECT value_json FROM platform_settings WHERE key = 'minimum_publisher_payout_micros'"
+    );
+    const minPayoutMicros = parseSettingNumber(minPayoutRow?.value_json, 50_000_000);
 
-    const stats = db
-      .prepare(
-        `SELECT
-           (SELECT COUNT(*) FROM ad_requests WHERE publisher_id = ?) AS total_requests,
-           (SELECT COUNT(*) FROM ad_requests WHERE publisher_id = ? AND filled = 1) AS filled_requests,
-           (SELECT COUNT(*) FROM impressions WHERE publisher_id = ? AND is_valid = 1) AS impressions,
-           (SELECT COUNT(*) FROM clicks WHERE publisher_id = ? AND is_valid = 1) AS clicks`
-      )
-      .get(publisherId, publisherId, publisherId, publisherId) as {
+    const stats = (await db.queryOne<{
       total_requests: number;
       filled_requests: number;
       impressions: number;
       clicks: number;
-    };
+    }>(
+      `SELECT
+         (SELECT COUNT(*) FROM ad_requests WHERE publisher_id = ?) AS total_requests,
+         (SELECT COUNT(*) FROM ad_requests WHERE publisher_id = ? AND filled = 1) AS filled_requests,
+         (SELECT COUNT(*) FROM impressions WHERE publisher_id = ? AND is_valid = 1) AS impressions,
+         (SELECT COUNT(*) FROM clicks WHERE publisher_id = ? AND is_valid = 1) AS clicks`,
+      [publisherId, publisherId, publisherId, publisherId]
+    ))!;
 
-    const dailyRevenue = db
-      .prepare(
-        `SELECT date(created_at) AS day,
-                COUNT(*) AS impressions,
-                COALESCE(SUM(publisher_share_micros), 0) AS imp_earnings_micros
-         FROM impressions
-         WHERE publisher_id = ? AND is_valid = 1
-         GROUP BY date(created_at)
-         ORDER BY day ASC
-         LIMIT 14`
-      )
-      .all(publisherId) as Array<{ day: string; impressions: number; imp_earnings_micros: number }>;
+    const totalRequests = Number(stats.total_requests);
+    const filledRequests = Number(stats.filled_requests);
+    const impressionsCount = Number(stats.impressions);
+    const clicksCount = Number(stats.clicks);
 
-    const clickRev = db
-      .prepare(
-        `SELECT date(created_at) AS day,
-                COUNT(*) AS clicks,
-                COALESCE(SUM(publisher_share_micros), 0) AS clk_earnings_micros
-         FROM clicks
-         WHERE publisher_id = ? AND is_valid = 1
-         GROUP BY date(created_at)`
-      )
-      .all(publisherId) as Array<{ day: string; clicks: number; clk_earnings_micros: number }>;
+    const dailyRevenue = await db.query<{
+      day: string;
+      impressions: number;
+      imp_earnings_micros: number;
+    }>(
+      `SELECT date(created_at) AS day,
+              COUNT(*) AS impressions,
+              COALESCE(SUM(publisher_share_micros), 0) AS imp_earnings_micros
+       FROM impressions
+       WHERE publisher_id = ? AND is_valid = 1
+       GROUP BY date(created_at)
+       ORDER BY day ASC
+       LIMIT 14`,
+      [publisherId]
+    );
+
+    const clickRev = await db.query<{
+      day: string;
+      clicks: number;
+      clk_earnings_micros: number;
+    }>(
+      `SELECT date(created_at) AS day,
+              COUNT(*) AS clicks,
+              COALESCE(SUM(publisher_share_micros), 0) AS clk_earnings_micros
+       FROM clicks
+       WHERE publisher_id = ? AND is_valid = 1
+       GROUP BY date(created_at)`,
+      [publisherId]
+    );
     const clickMap = new Map(clickRev.map((c) => [c.day, c]));
 
     const revenueSeries = dailyRevenue.map((d) => {
       const clk = clickMap.get(d.day);
       return {
         day: d.day,
-        impressions: d.impressions,
-        clicks: clk?.clicks ?? 0,
-        earningsMicros: d.imp_earnings_micros + (clk?.clk_earnings_micros ?? 0),
+        impressions: Number(d.impressions),
+        clicks: Number(clk?.clicks ?? 0),
+        earningsMicros: Number(d.imp_earnings_micros) + Number(clk?.clk_earnings_micros ?? 0),
       };
     });
 
-    const fillRate = stats.total_requests > 0 ? stats.filled_requests / stats.total_requests : 0;
-    const ctr = stats.impressions > 0 ? stats.clicks / stats.impressions : 0;
+    const fillRate = totalRequests > 0 ? filledRequests / totalRequests : 0;
+    const ctr = impressionsCount > 0 ? clicksCount / impressionsCount : 0;
     const totalSeriesMicros = revenueSeries.reduce((sum, r) => sum + r.earningsMicros, 0);
-    const ecpmMicros = stats.impressions > 0 ? Math.round((totalSeriesMicros / stats.impressions) * 1000) : 0;
+    const ecpmMicros = impressionsCount > 0 ? Math.round((totalSeriesMicros / impressionsCount) * 1000) : 0;
 
     res.json({
       account,
       wallet,
       defaultShareBps: defaultBps,
       minPayoutMicros,
-      featureFlags: getFeatureFlags(db),
+      featureFlags: await getFeatureFlags(db),
       kpis: {
-        ...stats,
+        total_requests: totalRequests,
+        filled_requests: filledRequests,
+        impressions: impressionsCount,
+        clicks: clicksCount,
         fillRate,
         ctr,
         ecpmMicros,
@@ -123,31 +146,30 @@ export function createPublisherRouter(db: DatabaseSync): Router {
   });
 
   // GET /api/publisher/properties
-  router.get('/properties', (req: AuthenticatedRequest, res: Response) => {
-    const publisherId = resolvePublisherId(req);
+  router.get('/properties', async (req: AuthenticatedRequest, res: Response) => {
+    const publisherId = await resolvePublisherId(req);
     if (!publisherId) {
       res.status(404).json({ error: 'Publisher account not found' });
       return;
     }
 
-    const properties = db
-      .prepare(
-        `SELECT p.*,
-                dv.method AS verification_method, dv.verification_token, dv.verified_at,
-                (SELECT COUNT(*) FROM ad_placements ap WHERE ap.property_id = p.id) AS placement_count
-         FROM publisher_properties p
-         LEFT JOIN domain_verifications dv ON dv.property_id = p.id
-         WHERE p.publisher_id = ?
-         ORDER BY p.created_at DESC`
-      )
-      .all(publisherId);
+    const properties = await db.query(
+      `SELECT p.*,
+              dv.method AS verification_method, dv.verification_token, dv.verified_at,
+              (SELECT COUNT(*) FROM ad_placements ap WHERE ap.property_id = p.id) AS placement_count
+       FROM publisher_properties p
+       LEFT JOIN domain_verifications dv ON dv.property_id = p.id
+       WHERE p.publisher_id = ?
+       ORDER BY p.created_at DESC`,
+      [publisherId]
+    );
 
     res.json({ properties });
   });
 
   // POST /api/publisher/properties
-  router.post('/properties', (req: AuthenticatedRequest, res: Response) => {
-    const publisherId = resolvePublisherId(req);
+  router.post('/properties', async (req: AuthenticatedRequest, res: Response) => {
+    const publisherId = await resolvePublisherId(req);
     if (!publisherId) {
       res.status(404).json({ error: 'Publisher account not found' });
       return;
@@ -167,33 +189,40 @@ export function createPublisherRouter(db: DatabaseSync): Router {
         ? `looma-ads.com, ${publisherId}, DIRECT, ${crypto.randomBytes(4).toString('hex')}`
         : `looma-verify=${crypto.randomBytes(6).toString('hex')}`;
 
-    withTransaction(db, () => {
-      db.prepare(
+    await withTransaction(db, async (tx) => {
+      await tx.execute(
         `INSERT INTO publisher_properties (id, publisher_id, property_type, name, domain_or_bundle, category, language, verification_status, approval_status, monthly_pageviews)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 'pending', ?)`
-      ).run(propId, publisherId, propertyType, name, domainOrBundle, category, language, monthlyPageviews);
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 'pending', ?)`,
+        [propId, publisherId, propertyType, name, domainOrBundle, category, language, monthlyPageviews]
+      );
 
-      db.prepare(
+      await tx.execute(
         `INSERT INTO domain_verifications (id, property_id, method, verification_token, status)
-         VALUES (?, ?, ?, ?, 'pending')`
-      ).run(`ver_${crypto.randomUUID().slice(0, 10)}`, propId, verificationMethod, token);
+         VALUES (?, ?, ?, ?, 'pending')`,
+        [`ver_${crypto.randomUUID().slice(0, 10)}`, propId, verificationMethod, token]
+      );
     });
 
     res.status(201).json({ propertyId: propId, verificationToken: token });
   });
 
   // PATCH /api/publisher/properties/:id
-  router.patch('/properties/:id', (req: AuthenticatedRequest, res: Response) => {
-    const publisherId = resolvePublisherId(req);
+  router.patch('/properties/:id', async (req: AuthenticatedRequest, res: Response) => {
+    const publisherId = await resolvePublisherId(req);
     if (!publisherId) {
       res.status(404).json({ error: 'Publisher account not found' });
       return;
     }
-    const existing = db
-      .prepare('SELECT id, name, category, language, monthly_pageviews FROM publisher_properties WHERE id = ? AND publisher_id = ?')
-      .get(String(req.params.id), publisherId) as
-      | { id: string; name: string; category: string; language: string; monthly_pageviews: number }
-      | undefined;
+    const existing = await db.queryOne<{
+      id: string;
+      name: string;
+      category: string;
+      language: string;
+      monthly_pageviews: number;
+    }>(
+      'SELECT id, name, category, language, monthly_pageviews FROM publisher_properties WHERE id = ? AND publisher_id = ?',
+      [String(req.params.id), publisherId]
+    );
     if (!existing) {
       res.status(404).json({ error: 'Property not found' });
       return;
@@ -225,7 +254,7 @@ export function createPublisherRouter(db: DatabaseSync): Router {
         nextLang = cleanLang.toLowerCase();
       }
     }
-    let nextViews = existing.monthly_pageviews;
+    let nextViews = Number(existing.monthly_pageviews);
     if (monthlyPageviews !== undefined) {
       const viewsRes = validateNumberRange(monthlyPageviews, {
         label: 'Monthly pageviews',
@@ -243,43 +272,47 @@ export function createPublisherRouter(db: DatabaseSync): Router {
       return;
     }
 
-    db.prepare(
-      'UPDATE publisher_properties SET name = ?, category = ?, language = ?, monthly_pageviews = ? WHERE id = ? AND publisher_id = ?'
-    ).run(nextName, nextCategory, nextLang, nextViews, existing.id, publisherId);
+    await db.execute(
+      'UPDATE publisher_properties SET name = ?, category = ?, language = ?, monthly_pageviews = ? WHERE id = ? AND publisher_id = ?',
+      [nextName, nextCategory, nextLang, nextViews, existing.id, publisherId]
+    );
 
     res.json({ updated: true, id: existing.id });
   });
 
   // DELETE /api/publisher/properties/:id
-  router.delete('/properties/:id', (req: AuthenticatedRequest, res: Response) => {
-    const publisherId = resolvePublisherId(req);
+  router.delete('/properties/:id', async (req: AuthenticatedRequest, res: Response) => {
+    const publisherId = await resolvePublisherId(req);
     if (!publisherId) {
       res.status(404).json({ error: 'Publisher account not found' });
       return;
     }
-    const existing = db
-      .prepare('SELECT id FROM publisher_properties WHERE id = ? AND publisher_id = ?')
-      .get(String(req.params.id), publisherId) as { id: string } | undefined;
+    const existing = await db.queryOne<{ id: string }>(
+      'SELECT id FROM publisher_properties WHERE id = ? AND publisher_id = ?',
+      [String(req.params.id), publisherId]
+    );
     if (!existing) {
       res.status(404).json({ error: 'Property not found' });
       return;
     }
 
-    const placementCount = db
-      .prepare('SELECT COUNT(*) AS cnt FROM ad_placements WHERE property_id = ?')
-      .get(existing.id) as { cnt: number };
-    const reqCount = db
-      .prepare('SELECT COUNT(*) AS cnt FROM ad_requests WHERE property_id = ?')
-      .get(existing.id) as { cnt: number };
+    const placementCount = await db.queryOne<{ cnt: number }>(
+      'SELECT COUNT(*) AS cnt FROM ad_placements WHERE property_id = ?',
+      [existing.id]
+    );
+    const reqCount = await db.queryOne<{ cnt: number }>(
+      'SELECT COUNT(*) AS cnt FROM ad_requests WHERE property_id = ?',
+      [existing.id]
+    );
 
-    if (placementCount.cnt > 0 || reqCount.cnt > 0) {
+    if (Number(placementCount?.cnt ?? 0) > 0 || Number(reqCount?.cnt ?? 0) > 0) {
       res.status(409).json({ error: 'Cannot delete a property that has active placements or ad delivery history' });
       return;
     }
 
-    withTransaction(db, () => {
-      db.prepare('DELETE FROM domain_verifications WHERE property_id = ?').run(existing.id);
-      db.prepare('DELETE FROM publisher_properties WHERE id = ? AND publisher_id = ?').run(existing.id, publisherId);
+    await withTransaction(db, async (tx) => {
+      await tx.execute('DELETE FROM domain_verifications WHERE property_id = ?', [existing.id]);
+      await tx.execute('DELETE FROM publisher_properties WHERE id = ? AND publisher_id = ?', [existing.id, publisherId]);
     });
 
     res.json({ deleted: true, id: existing.id });
@@ -287,22 +320,24 @@ export function createPublisherRouter(db: DatabaseSync): Router {
 
   // POST /api/publisher/properties/:id/verify (Live DNS TXT / ads.txt / meta verification with optional sandbox override)
   router.post('/properties/:id/verify', async (req: AuthenticatedRequest, res: Response) => {
-    const publisherId = resolvePublisherId(req);
+    const publisherId = await resolvePublisherId(req);
     if (!publisherId) {
       res.status(404).json({ error: 'Publisher account not found' });
       return;
     }
 
-    const prop = db
-      .prepare(
-        `SELECT p.id, p.domain_or_bundle, dv.method, dv.verification_token
-         FROM publisher_properties p
-         LEFT JOIN domain_verifications dv ON dv.property_id = p.id
-         WHERE p.id = ? AND p.publisher_id = ?`
-      )
-      .get(String(req.params.id), publisherId) as
-      | { id: string; domain_or_bundle: string; method: string | null; verification_token: string | null }
-      | undefined;
+    const prop = await db.queryOne<{
+      id: string;
+      domain_or_bundle: string;
+      method: string | null;
+      verification_token: string | null;
+    }>(
+      `SELECT p.id, p.domain_or_bundle, dv.method, dv.verification_token
+       FROM publisher_properties p
+       LEFT JOIN domain_verifications dv ON dv.property_id = p.id
+       WHERE p.id = ? AND p.publisher_id = ?`,
+      [String(req.params.id), publisherId]
+    );
 
     if (!prop) {
       res.status(404).json({ error: 'Property not found' });
@@ -317,9 +352,27 @@ export function createPublisherRouter(db: DatabaseSync): Router {
     const token = prop.verification_token || '';
 
     if (sandboxOverride) {
-      withTransaction(db, () => {
-        db.prepare("UPDATE publisher_properties SET verification_status = 'verified' WHERE id = ?").run(prop.id);
-        db.prepare("UPDATE domain_verifications SET status = 'verified', verified_at = datetime('now') WHERE property_id = ?").run(prop.id);
+      const sandboxVerificationAllowed =
+        req.auth?.role === 'admin' ||
+        process.env.ALLOW_SANDBOX_VERIFICATION === 'true' ||
+        (process.env.ALLOW_SANDBOX_VERIFICATION !== 'false' &&
+          process.env.NODE_ENV !== 'production' &&
+          process.env.LOOMA_RUNTIME !== 'cloudflare-worker');
+
+      if (!sandboxVerificationAllowed) {
+        res.status(403).json({
+          error: 'Sandbox domain verification override requires administrator privileges in production.',
+        });
+        return;
+      }
+
+      const nowIso = new Date().toISOString();
+      await withTransaction(db, async (tx) => {
+        await tx.execute("UPDATE publisher_properties SET verification_status = 'verified' WHERE id = ?", [prop.id]);
+        await tx.execute("UPDATE domain_verifications SET status = 'verified', verified_at = ? WHERE property_id = ?", [
+          nowIso,
+          prop.id,
+        ]);
       });
       res.json({
         verified: true,
@@ -334,9 +387,13 @@ export function createPublisherRouter(db: DatabaseSync): Router {
 
     const liveResult = await verifyDomainOwnershipLive(prop.domain_or_bundle, method, token);
     if (liveResult.verified) {
-      withTransaction(db, () => {
-        db.prepare("UPDATE publisher_properties SET verification_status = 'verified' WHERE id = ?").run(prop.id);
-        db.prepare("UPDATE domain_verifications SET status = 'verified', verified_at = datetime('now') WHERE property_id = ?").run(prop.id);
+      const nowIso = new Date().toISOString();
+      await withTransaction(db, async (tx) => {
+        await tx.execute("UPDATE publisher_properties SET verification_status = 'verified' WHERE id = ?", [prop.id]);
+        await tx.execute("UPDATE domain_verifications SET status = 'verified', verified_at = ? WHERE property_id = ?", [
+          nowIso,
+          prop.id,
+        ]);
       });
     }
 
@@ -351,31 +408,30 @@ export function createPublisherRouter(db: DatabaseSync): Router {
   });
 
   // GET /api/publisher/placements
-  router.get('/placements', (req: AuthenticatedRequest, res: Response) => {
-    const publisherId = resolvePublisherId(req);
+  router.get('/placements', async (req: AuthenticatedRequest, res: Response) => {
+    const publisherId = await resolvePublisherId(req);
     if (!publisherId) {
       res.status(404).json({ error: 'Publisher account not found' });
       return;
     }
 
-    const placements = db
-      .prepare(
-        `SELECT ap.*, pp.name AS property_name, pp.domain_or_bundle, pp.approval_status AS property_approval,
-                (SELECT COUNT(*) FROM impressions i WHERE i.placement_id = ap.id AND i.is_valid = 1) AS impressions,
-                (SELECT COUNT(*) FROM clicks k WHERE k.placement_id = ap.id AND k.is_valid = 1) AS clicks
-         FROM ad_placements ap
-         JOIN publisher_properties pp ON pp.id = ap.property_id
-         WHERE ap.publisher_id = ?
-         ORDER BY ap.created_at DESC`
-      )
-      .all(publisherId);
+    const placements = await db.query(
+      `SELECT ap.*, pp.name AS property_name, pp.domain_or_bundle, pp.approval_status AS property_approval,
+              (SELECT COUNT(*) FROM impressions i WHERE i.placement_id = ap.id AND i.is_valid = 1) AS impressions,
+              (SELECT COUNT(*) FROM clicks k WHERE k.placement_id = ap.id AND k.is_valid = 1) AS clicks
+       FROM ad_placements ap
+       JOIN publisher_properties pp ON pp.id = ap.property_id
+       WHERE ap.publisher_id = ?
+       ORDER BY ap.created_at DESC`,
+      [publisherId]
+    );
 
     res.json({ placements });
   });
 
   // POST /api/publisher/placements
-  router.post('/placements', (req: AuthenticatedRequest, res: Response) => {
-    const publisherId = resolvePublisherId(req);
+  router.post('/placements', async (req: AuthenticatedRequest, res: Response) => {
+    const publisherId = await resolvePublisherId(req);
     if (!publisherId) {
       res.status(404).json({ error: 'Publisher account not found' });
       return;
@@ -388,9 +444,10 @@ export function createPublisherRouter(db: DatabaseSync): Router {
     }
     const { propertyId, name, format, dimensions, floorCpmUsd } = validation.value;
 
-    const prop = db
-      .prepare('SELECT id FROM publisher_properties WHERE id = ? AND publisher_id = ?')
-      .get(propertyId, publisherId);
+    const prop = await db.queryOne(
+      'SELECT id FROM publisher_properties WHERE id = ? AND publisher_id = ?',
+      [propertyId, publisherId]
+    );
     if (!prop) {
       res.status(404).json({ error: 'Publisher property not found' });
       return;
@@ -399,27 +456,33 @@ export function createPublisherRouter(db: DatabaseSync): Router {
     const placementId = `plc_${crypto.randomUUID().slice(0, 10)}`;
     const floorMicros = Math.round(floorCpmUsd * 1_000_000);
 
-    db.prepare(
+    await db.execute(
       `INSERT INTO ad_placements (id, property_id, publisher_id, name, format, dimensions, floor_cpm_micros, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'active')`
-    ).run(placementId, propertyId, publisherId, name, format, dimensions, floorMicros);
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'active')`,
+      [placementId, propertyId, publisherId, name, format, dimensions, floorMicros]
+    );
 
     res.status(201).json({ placementId });
   });
 
   // PATCH /api/publisher/placements/:id
-  router.patch('/placements/:id', (req: AuthenticatedRequest, res: Response) => {
-    const publisherId = resolvePublisherId(req);
+  router.patch('/placements/:id', async (req: AuthenticatedRequest, res: Response) => {
+    const publisherId = await resolvePublisherId(req);
     if (!publisherId) {
       res.status(404).json({ error: 'Publisher account not found' });
       return;
     }
 
-    const existing = db
-      .prepare('SELECT id, name, dimensions, floor_cpm_micros, status FROM ad_placements WHERE id = ? AND publisher_id = ?')
-      .get(String(req.params.id), publisherId) as
-      | { id: string; name: string; dimensions: string; floor_cpm_micros: number; status: string }
-      | undefined;
+    const existing = await db.queryOne<{
+      id: string;
+      name: string;
+      dimensions: string;
+      floor_cpm_micros: number;
+      status: string;
+    }>(
+      'SELECT id, name, dimensions, floor_cpm_micros, status FROM ad_placements WHERE id = ? AND publisher_id = ?',
+      [String(req.params.id), publisherId]
+    );
 
     if (!existing) {
       res.status(404).json({ error: 'Placement not found' });
@@ -448,7 +511,7 @@ export function createPublisherRouter(db: DatabaseSync): Router {
       if (dimErr) fieldErrors.dimensions = dimErr;
       else nextDimensions = asTrimmedString(dimensions) || existing.dimensions;
     }
-    let nextFloorMicros = existing.floor_cpm_micros;
+    let nextFloorMicros = Number(existing.floor_cpm_micros);
     if (floorCpmUsd !== undefined) {
       const floorRes = validateNumberRange(floorCpmUsd, { label: 'Floor CPM', min: 0.1, max: 500, currency: true });
       if (floorRes.error) fieldErrors.floorCpmUsd = floorRes.error;
@@ -461,92 +524,106 @@ export function createPublisherRouter(db: DatabaseSync): Router {
       return;
     }
 
-    db.prepare(
-      'UPDATE ad_placements SET status = ?, name = ?, dimensions = ?, floor_cpm_micros = ? WHERE id = ? AND publisher_id = ?'
-    ).run(nextStatus, nextName, nextDimensions, nextFloorMicros, existing.id, publisherId);
+    await db.execute(
+      'UPDATE ad_placements SET status = ?, name = ?, dimensions = ?, floor_cpm_micros = ? WHERE id = ? AND publisher_id = ?',
+      [nextStatus, nextName, nextDimensions, nextFloorMicros, existing.id, publisherId]
+    );
 
     res.json({ updated: true, id: existing.id });
   });
 
   // DELETE /api/publisher/placements/:id
-  router.delete('/placements/:id', (req: AuthenticatedRequest, res: Response) => {
-    const publisherId = resolvePublisherId(req);
+  router.delete('/placements/:id', async (req: AuthenticatedRequest, res: Response) => {
+    const publisherId = await resolvePublisherId(req);
     if (!publisherId) {
       res.status(404).json({ error: 'Publisher account not found' });
       return;
     }
 
-    const existing = db
-      .prepare('SELECT id FROM ad_placements WHERE id = ? AND publisher_id = ?')
-      .get(String(req.params.id), publisherId) as { id: string } | undefined;
+    const existing = await db.queryOne<{ id: string }>(
+      'SELECT id FROM ad_placements WHERE id = ? AND publisher_id = ?',
+      [String(req.params.id), publisherId]
+    );
     if (!existing) {
       res.status(404).json({ error: 'Placement not found' });
       return;
     }
 
-    const historyCount = db
-      .prepare(
-        `SELECT
-           (SELECT COUNT(*) FROM ad_requests WHERE placement_id = ?) +
-           (SELECT COUNT(*) FROM impressions WHERE placement_id = ?) +
-           (SELECT COUNT(*) FROM clicks WHERE placement_id = ?) +
-           (SELECT COUNT(*) FROM video_events WHERE placement_id = ?) AS cnt`
-      )
-      .get(existing.id, existing.id, existing.id, existing.id) as { cnt: number };
+    const historyCount = await db.queryOne<{ cnt: number }>(
+      `SELECT
+         (SELECT COUNT(*) FROM ad_requests WHERE placement_id = ?) +
+         (SELECT COUNT(*) FROM impressions WHERE placement_id = ?) +
+         (SELECT COUNT(*) FROM clicks WHERE placement_id = ?) +
+         (SELECT COUNT(*) FROM video_events WHERE placement_id = ?) AS cnt`,
+      [existing.id, existing.id, existing.id, existing.id]
+    );
 
-    if (historyCount.cnt > 0) {
-      db.prepare("UPDATE ad_placements SET status = 'disabled' WHERE id = ? AND publisher_id = ?").run(existing.id, publisherId);
+    if (Number(historyCount?.cnt ?? 0) > 0) {
+      await db.execute("UPDATE ad_placements SET status = 'disabled' WHERE id = ? AND publisher_id = ?", [
+        existing.id,
+        publisherId,
+      ]);
       res.json({ deleted: false, disabled: true, id: existing.id });
       return;
     }
 
-    db.prepare('DELETE FROM ad_placements WHERE id = ? AND publisher_id = ?').run(existing.id, publisherId);
+    await db.execute('DELETE FROM ad_placements WHERE id = ? AND publisher_id = ?', [existing.id, publisherId]);
     res.json({ deleted: true, disabled: false, id: existing.id });
   });
 
   // GET /api/publisher/earnings
-  router.get('/earnings', (req: AuthenticatedRequest, res: Response) => {
-    const publisherId = resolvePublisherId(req);
+  router.get('/earnings', async (req: AuthenticatedRequest, res: Response) => {
+    const publisherId = await resolvePublisherId(req);
     if (!publisherId) {
       res.status(404).json({ error: 'Publisher account not found' });
       return;
     }
 
-    const wallet = db.prepare('SELECT * FROM publisher_wallets WHERE publisher_id = ?').get(publisherId) as { id: string } | undefined;
+    const wallet = await db.queryOne<{ id: string }>(
+      'SELECT * FROM publisher_wallets WHERE publisher_id = ?',
+      [publisherId]
+    );
     if (!wallet) {
       res.status(404).json({ error: 'Publisher wallet not found' });
       return;
     }
-    const account = db
-      .prepare('SELECT payout_method_type, payout_destination, custom_revenue_share_bps, publisher_type FROM publisher_accounts WHERE id = ?')
-      .get(publisherId);
-    const withdrawals = db.prepare('SELECT * FROM withdrawals WHERE publisher_id = ? ORDER BY created_at DESC').all(publisherId);
-    const ledger = db
-      .prepare("SELECT * FROM financial_ledger WHERE account_type = 'publisher_wallet' AND account_id = ? ORDER BY created_at DESC LIMIT 50")
-      .all(wallet.id);
+    const account = await db.queryOne(
+      'SELECT payout_method_type, payout_destination, custom_revenue_share_bps, publisher_type FROM publisher_accounts WHERE id = ?',
+      [publisherId]
+    );
+    const withdrawals = await db.query(
+      'SELECT * FROM withdrawals WHERE publisher_id = ? ORDER BY created_at DESC',
+      [publisherId]
+    );
+    const ledger = await db.query(
+      "SELECT * FROM financial_ledger WHERE account_type = 'publisher_wallet' AND account_id = ? ORDER BY created_at DESC LIMIT 50",
+      [wallet.id]
+    );
 
-    const minPayoutRow = db
-      .prepare("SELECT value_json FROM platform_settings WHERE key = 'minimum_publisher_payout_micros'")
-      .get() as { value_json: string } | undefined;
-    const minPayoutMicros = minPayoutRow ? Number(JSON.parse(minPayoutRow.value_json)) : 50_000_000;
+    const minPayoutRow = await db.queryOne<{ value_json: string }>(
+      "SELECT value_json FROM platform_settings WHERE key = 'minimum_publisher_payout_micros'"
+    );
+    const minPayoutMicros = parseSettingNumber(minPayoutRow?.value_json, 50_000_000);
 
-    res.json({ wallet, account, withdrawals, ledger, minPayoutMicros, featureFlags: getFeatureFlags(db) });
+    res.json({ wallet, account, withdrawals, ledger, minPayoutMicros, featureFlags: await getFeatureFlags(db) });
   });
 
   // POST /api/publisher/withdraw
-  router.post('/withdraw', (req: AuthenticatedRequest, res: Response) => {
-    const publisherId = resolvePublisherId(req);
+  router.post('/withdraw', async (req: AuthenticatedRequest, res: Response) => {
+    const publisherId = await resolvePublisherId(req);
     if (!publisherId) {
       res.status(404).json({ error: 'Publisher account not found' });
       return;
     }
 
-    const pubTypeRow = db
-      .prepare('SELECT publisher_type FROM publisher_accounts WHERE id = ?')
-      .get(publisherId) as { publisher_type: string | null } | undefined;
+    const pubTypeRow = await db.queryOne<{ publisher_type: string | null }>(
+      'SELECT publisher_type FROM publisher_accounts WHERE id = ?',
+      [publisherId]
+    );
+    const flags = await getFeatureFlags(db);
     if (
       pubTypeRow?.publisher_type === 'third_party' &&
-      !getFeatureFlags(db).third_party_publisher_payouts_enabled
+      !flags.third_party_publisher_payouts_enabled
     ) {
       res.status(403).json({
         error: 'Third-party publisher payouts are disabled until the external publisher expansion phase.',
@@ -554,10 +631,10 @@ export function createPublisherRouter(db: DatabaseSync): Router {
       return;
     }
 
-    const minPayoutRow = db
-      .prepare("SELECT value_json FROM platform_settings WHERE key = 'minimum_publisher_payout_micros'")
-      .get() as { value_json: string } | undefined;
-    const minPayoutMicros = minPayoutRow ? Number(JSON.parse(minPayoutRow.value_json)) : 50_000_000;
+    const minPayoutRow = await db.queryOne<{ value_json: string }>(
+      "SELECT value_json FROM platform_settings WHERE key = 'minimum_publisher_payout_micros'"
+    );
+    const minPayoutMicros = parseSettingNumber(minPayoutRow?.value_json, 50_000_000);
 
     const wdrValidation = validateWithdrawalInput({
       ...(req.body ?? {}),
@@ -570,16 +647,17 @@ export function createPublisherRouter(db: DatabaseSync): Router {
     const { amountUsd: parsedAmount, payoutMethod, payoutDestination } = wdrValidation.value;
     const amountMicros = Math.round(parsedAmount * 1_000_000);
 
-    const outcome = withTransaction(db, () => {
-      const wallet = db
-        .prepare('SELECT id, available_micros, pending_micros FROM publisher_wallets WHERE publisher_id = ?')
-        .get(publisherId) as { id: string; available_micros: number; pending_micros: number };
-      const pub = db
-        .prepare('SELECT payout_method_type, payout_destination FROM publisher_accounts WHERE id = ?')
-        .get(publisherId) as { payout_method_type: string; payout_destination: string };
-
-      if (wallet.available_micros < amountMicros) {
-        return { error: 'Withdrawal amount exceeds finalized available balance' };
+    const outcome = await withTransaction(db, async (tx) => {
+      const wallet = await tx.queryOne<{ id: string }>(
+        'SELECT id FROM publisher_wallets WHERE publisher_id = ?',
+        [publisherId]
+      );
+      const pub = await tx.queryOne<{ payout_method_type: string; payout_destination: string }>(
+        'SELECT payout_method_type, payout_destination FROM publisher_accounts WHERE id = ?',
+        [publisherId]
+      );
+      if (!wallet || !pub) {
+        return { error: 'Publisher wallet not found' };
       }
 
       const method = String(payoutMethod || pub.payout_method_type || 'bank_transfer');
@@ -588,18 +666,29 @@ export function createPublisherRouter(db: DatabaseSync): Router {
         return { error: 'Please configure a payout destination before requesting withdrawal' };
       }
 
-      const newAvailable = wallet.available_micros - amountMicros;
-      const newPending = wallet.pending_micros + amountMicros;
+      const debitRes = await tx.execute(
+        `UPDATE publisher_wallets
+         SET available_micros = available_micros - ?, pending_micros = pending_micros + ?, updated_at = ?
+         WHERE id = ? AND available_micros >= ?`,
+        [amountMicros, amountMicros, new Date().toISOString(), wallet.id, amountMicros]
+      );
+      if (debitRes.rowCount === 0) {
+        return { error: 'Withdrawal amount exceeds finalized available balance' };
+      }
+
+      const updatedWallet = (await tx.queryOne<{ available_micros: number; pending_micros: number }>(
+        'SELECT available_micros, pending_micros FROM publisher_wallets WHERE id = ?',
+        [wallet.id]
+      ))!;
+      const newAvailable = Number(updatedWallet.available_micros);
+      const newPending = Number(updatedWallet.pending_micros);
       const withdrawalId = `wdr_${crypto.randomUUID().slice(0, 10)}`;
 
-      db.prepare(
-        `UPDATE publisher_wallets SET available_micros = ?, pending_micros = ?, updated_at = datetime('now') WHERE id = ?`
-      ).run(newAvailable, newPending, wallet.id);
-
-      db.prepare(
+      await tx.execute(
         `INSERT INTO withdrawals (id, publisher_id, amount_micros, currency, payout_method, payout_destination, status, notes)
-         VALUES (?, ?, ?, 'USD', ?, ?, 'pending', 'Publisher payout request queued for admin reconciliation')`
-      ).run(withdrawalId, publisherId, amountMicros, method, destination);
+         VALUES (?, ?, ?, 'USD', ?, ?, 'pending', 'Publisher payout request queued for admin reconciliation')`,
+        [withdrawalId, publisherId, amountMicros, method, destination]
+      );
 
       return { withdrawalId, availableMicros: newAvailable, pendingMicros: newPending };
     });
@@ -612,8 +701,8 @@ export function createPublisherRouter(db: DatabaseSync): Router {
   });
 
   // PATCH /api/publisher/payout-method
-  router.patch('/payout-method', (req: AuthenticatedRequest, res: Response) => {
-    const publisherId = resolvePublisherId(req);
+  router.patch('/payout-method', async (req: AuthenticatedRequest, res: Response) => {
+    const publisherId = await resolvePublisherId(req);
     if (!publisherId) {
       res.status(404).json({ error: 'Publisher account not found' });
       return;
@@ -623,9 +712,10 @@ export function createPublisherRouter(db: DatabaseSync): Router {
       res.status(400).json({ error: pmValidation.firstError, fieldErrors: pmValidation.errors });
       return;
     }
-    db.prepare(
-      'UPDATE publisher_accounts SET payout_method_type = ?, payout_destination = ? WHERE id = ?'
-    ).run(pmValidation.value.payoutMethodType, pmValidation.value.payoutDestination, publisherId);
+    await db.execute(
+      'UPDATE publisher_accounts SET payout_method_type = ?, payout_destination = ? WHERE id = ?',
+      [pmValidation.value.payoutMethodType, pmValidation.value.payoutDestination, publisherId]
+    );
     res.json({ updated: true });
   });
 

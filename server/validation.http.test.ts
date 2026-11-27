@@ -19,8 +19,8 @@ async function startValidationServer() {
   const tempUploadDir = fs.mkdtempSync(path.join(os.tmpdir(), 'looma-val-test-'));
   process.env.LOOMA_STORAGE_DIR = tempUploadDir;
 
-  const db = getDb(':memory:');
-  seedDatabaseIfEmpty(db);
+  const db = await getDb(':memory:');
+  await seedDatabaseIfEmpty(db);
 
   const app = express();
   app.use(express.json({ limit: '15mb' }));
@@ -80,10 +80,10 @@ async function startValidationServer() {
   }
 
   async function authenticateActors() {
-    db.prepare("UPDATE users SET password_hash = ? WHERE id = 'usr_adv_1'").run(hashPassword('TestAdvPass!123'));
-    db.prepare("UPDATE users SET password_hash = ? WHERE id = 'usr_pub_looma'").run(hashPassword('TestPubPass!123'));
-    const advRow = db.prepare("SELECT email FROM users WHERE id = 'usr_adv_1'").get() as { email: string };
-    const pubRow = db.prepare("SELECT email FROM users WHERE id = 'usr_pub_looma'").get() as { email: string };
+    await db.execute("UPDATE users SET password_hash = ? WHERE id = 'usr_adv_1'", [hashPassword('TestAdvPass!123')]);
+    await db.execute("UPDATE users SET password_hash = ? WHERE id = 'usr_pub_looma'", [hashPassword('TestPubPass!123')]);
+    const advRow = (await db.queryOne<{ email: string }>("SELECT email FROM users WHERE id = 'usr_adv_1'"))!;
+    const pubRow = (await db.queryOne<{ email: string }>("SELECT email FROM users WHERE id = 'usr_pub_looma'"))!;
 
     const advLogin = await reqJson('/api/auth/login', {
       method: 'POST',
@@ -114,6 +114,7 @@ async function startValidationServer() {
 
   async function close() {
     await new Promise<void>((resolve) => server.close(() => resolve()));
+    await db.close();
     fs.rmSync(tempUploadDir, { recursive: true, force: true });
   }
 

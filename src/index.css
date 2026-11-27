@@ -1,15 +1,30 @@
 @import "tailwindcss";
 @custom-variant dark (&:where(.dark, .dark *));
 
+@theme {
+  --color-brand-50: #f5f3ff;
+  --color-brand-100: #ede9fe;
+  --color-brand-200: #ddd6fe;
+  --color-brand-400: #a78bfa;
+  --color-brand-500: #7c3aed;
+  --color-brand-600: #6320ee;
+  --color-brand-700: #5319d6;
+  --color-brand-800: #4312ab;
+  --color-brand-900: #2e0b78;
+  --color-darknavy: #0b0f19;
+  --color-cardbg: #f8fafc;
+}
+
 @layer base {
   :root {
     --font-display: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
-    --font-sans: 'DM Sans', system-ui, -apple-system, sans-serif;
+    --font-sans: 'Plus Jakarta Sans', 'DM Sans', system-ui, -apple-system, sans-serif;
     --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
   }
 
   html {
     font-family: var(--font-sans);
+    scroll-behavior: smooth;
   }
 
   h1, h2, h3, h4, .font-display {
@@ -25,7 +40,37 @@
   font-variant-numeric: tabular-nums;
 }
 
+.perspective-laptop {
+  perspective: 1200px;
+}
+
+.laptop-tilt {
+  transform: rotateY(-14deg) rotateX(10deg) rotateZ(1deg);
+  transform-style: preserve-3d;
+  box-shadow: -25px 35px 50px -15px rgba(29, 13, 79, 0.25);
+}
+
+.laptop-tilt:hover {
+  transform: rotateY(0deg) rotateX(0deg) rotateZ(0deg);
+}
+
+@media (max-width: 1023px) {
+  .laptop-tilt {
+    transform: none;
+    box-shadow: 0 20px 40px -15px rgba(29, 13, 79, 0.18);
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+
+  .laptop-tilt,
+  .laptop-tilt:hover {
+    transform: none !important;
+  }
+
   *, *::before, *::after {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;

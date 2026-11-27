@@ -1,7 +1,9 @@
 import React, { useEffect, useState } from 'react';
-import { X } from 'lucide-react';
+import { X, Eye } from 'lucide-react';
 import { apiRequest, extractFieldErrors, formatMicros, formatNumber } from '../lib/api';
 import { FieldError, fieldBorderClass } from './FieldError';
+import { LiveAdPreview } from './LiveAdPreview';
+import { getAdFormatSpec } from '../lib/adFormats';
 import {
   type FieldErrors,
   validatePlatformSettingsInput,
@@ -72,6 +74,8 @@ export const AdminWorkspace: React.FC<AdminWorkspaceProps> = ({ activeTab }) => 
   const [actionMsg, setActionMsg] = useState<string | null>(null);
   const [policyErrors, setPolicyErrors] = useState<FieldErrors>({});
   const [settingsErrors, setSettingsErrors] = useState<FieldErrors>({});
+  const [selectedModerationCampaignId, setSelectedModerationCampaignId] = useState<string | null>(null);
+  const [inspectorDimensionsOverride, setInspectorDimensionsOverride] = useState<string | null>(null);
 
   const clearPolicyError = (key: string) =>
     setPolicyErrors((prev) => {
@@ -129,6 +133,7 @@ export const AdminWorkspace: React.FC<AdminWorkspaceProps> = ({ activeTab }) => 
     setError(null);
     setPolicyErrors({});
     setSettingsErrors({});
+    setInspectorDimensionsOverride(null);
   }, [tab]);
 
   useEffect(() => {
@@ -446,50 +451,228 @@ export const AdminWorkspace: React.FC<AdminWorkspaceProps> = ({ activeTab }) => 
       )}
 
       {/* TAB: MODERATION */}
-      {tab === 'moderation' && moderation && (
+      {tab === 'moderation' && moderation && (() => {
+        const campaigns = moderation.campaigns || [];
+        const selectedCampaign =
+          campaigns.find((c) => c.id === selectedModerationCampaignId) ??
+          campaigns[0] ??
+          null;
+        const selectedFormat = String(selectedCampaign?.ad_format || 'native');
+        const selectedSpec = getAdFormatSpec(selectedFormat);
+        const submittedDimensions = String(
+          selectedCampaign?.dimensions || selectedSpec.defaultDimensions
+        );
+        const activeDimensions = inspectorDimensionsOverride || submittedDimensions;
+
+        return (
         <div className="space-y-6">
-          <div className="border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden bg-white dark:bg-slate-900">
-            <div className="px-5 py-3.5 border-b border-slate-200 dark:border-slate-800 text-sm font-semibold">
-              Campaign & Creative Moderation Queue
+          <div className="grid lg:grid-cols-12 gap-6 items-start">
+            <div className="lg:col-span-7 min-w-0 border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden bg-white dark:bg-slate-900">
+              <div className="px-5 py-3.5 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between gap-3">
+                <span className="text-sm font-semibold">Campaign & Creative Moderation Queue</span>
+                <span className="text-xs font-mono text-slate-500">
+                  {campaigns.length} campaign{campaigns.length === 1 ? '' : 's'}
+                </span>
+              </div>
+              {campaigns.length === 0 ? (
+                <div className="p-5 text-xs text-slate-500">No campaigns queued for moderation.</div>
+              ) : (
+                <div className="divide-y divide-slate-200 dark:divide-slate-800">
+                  {campaigns.map((c) => {
+                    const isSelected = selectedCampaign?.id === c.id;
+                    const rowFormat = String(c.ad_format || 'native');
+                    const rowSpec = getAdFormatSpec(rowFormat);
+                    const rowDims = String(c.dimensions || rowSpec.defaultDimensions);
+                    return (
+                      <div
+                        key={c.id}
+                        className={`p-4 sm:p-5 flex flex-wrap items-center justify-between gap-4 transition-colors ${
+                          isSelected
+                            ? 'bg-blue-50/50 dark:bg-blue-950/20'
+                            : 'hover:bg-slate-50/60 dark:hover:bg-slate-800/30'
+                        }`}
+                      >
+                        <div className="max-w-2xl min-w-0 flex-1">
+                          <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500">
+                            <span className="font-mono text-[11px] px-1.5 py-0.5 rounded bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300">
+                              {rowSpec.label} · {rowDims}
+                            </span>
+                            <span>
+                              {c.company_name} · {c.pricing_model} ({formatMicros(c.max_bid_micros)}) · Moderation: {c.moderation_status}
+                            </span>
+                          </div>
+                          <div className="text-base font-semibold text-slate-900 dark:text-white mt-1">{c.name}</div>
+                          <div className="text-xs text-slate-600 dark:text-slate-300 mt-1">
+                            Creative: <strong>{c.creative_title}</strong> — {c.creative_description}
+                          </div>
+                          <div className="text-[11px] font-mono text-slate-400 mt-1 break-all">{c.destination_url}</div>
+                        </div>
+                        <div className="flex flex-wrap items-center gap-2 shrink-0">
+                          <button
+                            type="button"
+                            aria-pressed={isSelected}
+                            onClick={() => {
+                              setSelectedModerationCampaignId(c.id);
+                              setInspectorDimensionsOverride(null);
+                            }}
+                            className={`inline-flex items-center gap-1 px-3 py-1.5 text-xs font-medium rounded-md border ${
+                              isSelected
+                                ? 'border-blue-700 bg-blue-700 text-white'
+                                : 'border-slate-300 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800'
+                            }`}
+                          >
+                            <Eye className="w-3.5 h-3.5" />
+                            <span>{isSelected ? 'Inspecting' : 'Preview Ad'}</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleModerationDecision(c.id, 'approved')}
+                            className="px-3 py-1.5 text-xs font-medium text-white bg-emerald-700 hover:bg-emerald-800 rounded-md"
+                          >
+                            Approve
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleModerationDecision(c.id, 'rejected')}
+                            className="px-3 py-1.5 text-xs font-medium border border-slate-300 dark:border-slate-700 rounded-md hover:bg-slate-100 dark:hover:bg-slate-800"
+                          >
+                            Reject
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleModerationDecision(c.id, 'suspended')}
+                            className="px-3 py-1.5 text-xs font-medium text-red-700 dark:text-red-300 border border-red-200 dark:border-red-900 rounded-md"
+                          >
+                            Suspend
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </div>
-            <div className="divide-y divide-slate-200 dark:divide-slate-800">
-              {moderation.campaigns.map((c) => (
-                <div key={c.id} className="p-4 sm:p-5 flex flex-wrap items-center justify-between gap-4">
-                  <div className="max-w-2xl min-w-0">
-                    <div className="text-xs text-slate-500">
-                      {c.company_name} · {c.pricing_model} ({formatMicros(c.max_bid_micros)}) · Moderation: {c.moderation_status}
-                    </div>
-                    <div className="text-base font-semibold text-slate-900 dark:text-white mt-0.5">{c.name}</div>
-                    <div className="text-xs text-slate-600 dark:text-slate-300 mt-1">
-                      Creative: <strong>{c.creative_title}</strong> — {c.creative_description}
-                    </div>
-                    <div className="text-[11px] font-mono text-slate-400 mt-1 break-all">{c.destination_url}</div>
+
+            <div
+              className="lg:col-span-5 min-w-0 lg:sticky lg:top-20 border border-slate-200 dark:border-slate-800 rounded-xl p-4 sm:p-5 bg-white dark:bg-slate-900 space-y-4"
+              data-testid="admin-creative-inspector"
+            >
+              <div className="flex flex-wrap items-start justify-between gap-2 pb-3 border-b border-slate-200 dark:border-slate-800">
+                <div className="min-w-0">
+                  <div className="text-xs font-mono uppercase tracking-wider text-slate-500">
+                    Live Creative Moderation Inspector
                   </div>
-                  <div className="flex flex-wrap items-center gap-2 shrink-0">
+                  {selectedCampaign ? (
+                    <h3 className="text-base font-semibold text-slate-900 dark:text-white mt-0.5 truncate">
+                      {selectedCampaign.name}
+                    </h3>
+                  ) : (
+                    <h3 className="text-base font-semibold text-slate-900 dark:text-white mt-0.5">
+                      No Creative Selected
+                    </h3>
+                  )}
+                </div>
+                {selectedCampaign && (
+                  <span className="text-[11px] font-mono capitalize px-2 py-0.5 rounded bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 shrink-0">
+                    {selectedCampaign.moderation_status}
+                  </span>
+                )}
+              </div>
+
+              {selectedCampaign ? (
+                <>
+                  {selectedSpec.dimensionsOptions.length > 1 && (
+                    <div className="space-y-1.5">
+                      <div className="flex items-center justify-between gap-2 text-xs">
+                        <span className="text-slate-500 dark:text-slate-400">Preview Slot Size</span>
+                        {inspectorDimensionsOverride && inspectorDimensionsOverride !== submittedDimensions && (
+                          <button
+                            type="button"
+                            onClick={() => setInspectorDimensionsOverride(null)}
+                            className="text-blue-700 dark:text-blue-400 hover:underline font-medium"
+                          >
+                            Submitted Default ({submittedDimensions})
+                          </button>
+                        )}
+                      </div>
+                      <div className="flex flex-wrap gap-1.5">
+                        {selectedSpec.dimensionsOptions.map((opt) => (
+                          <button
+                            key={opt.value}
+                            type="button"
+                            onClick={() => setInspectorDimensionsOverride(opt.value)}
+                            className={`px-2 py-1 text-[11px] font-mono rounded-md border transition-colors ${
+                              activeDimensions === opt.value
+                                ? 'border-blue-700 bg-blue-50 dark:bg-blue-950/40 text-blue-700 dark:text-blue-300 font-semibold'
+                                : 'border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800'
+                            }`}
+                          >
+                            {opt.value}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  <LiveAdPreview
+                    format={selectedFormat}
+                    dimensions={activeDimensions}
+                    pricingModel={String(selectedCampaign.pricing_model || 'CPC')}
+                    title={String(selectedCampaign.creative_title || selectedCampaign.name || '')}
+                    description={String(selectedCampaign.creative_description || '')}
+                    mediaUrl={String(selectedCampaign.media_url || '')}
+                    destinationUrl={String(selectedCampaign.destination_url || '')}
+                    ctaText={String(selectedCampaign.cta_text || selectedSpec.defaultCta)}
+                  />
+
+                  <div className="rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/60 p-3 text-xs space-y-1.5">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-slate-500">Advertiser</span>
+                      <span className="font-medium text-slate-900 dark:text-white truncate">
+                        {selectedCampaign.company_name}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-slate-500">Daily / Total Budget</span>
+                      <span className="font-mono text-slate-800 dark:text-slate-200">
+                        {formatMicros(selectedCampaign.daily_budget_micros)} / {formatMicros(selectedCampaign.total_budget_micros)}
+                      </span>
+                    </div>
+                    <div className="flex items-start justify-between gap-2">
+                      <span className="text-slate-500 shrink-0">Destination</span>
+                      <span className="font-mono text-[11px] text-slate-700 dark:text-slate-300 break-all text-right">
+                        {selectedCampaign.destination_url}
+                      </span>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-3 gap-2 pt-1">
                     <button
                       type="button"
-                      onClick={() => handleModerationDecision(c.id, 'approved')}
-                      className="px-3 py-1.5 text-xs font-medium text-white bg-emerald-700 hover:bg-emerald-800 rounded-md"
+                      onClick={() => handleModerationDecision(selectedCampaign.id, 'approved')}
+                      className="py-2 text-xs font-medium text-white bg-emerald-700 hover:bg-emerald-800 rounded-md"
                     >
                       Approve
                     </button>
                     <button
                       type="button"
-                      onClick={() => handleModerationDecision(c.id, 'rejected')}
-                      className="px-3 py-1.5 text-xs font-medium border border-slate-300 dark:border-slate-700 rounded-md hover:bg-slate-100 dark:hover:bg-slate-800"
+                      onClick={() => handleModerationDecision(selectedCampaign.id, 'rejected')}
+                      className="py-2 text-xs font-medium border border-slate-300 dark:border-slate-700 rounded-md hover:bg-slate-100 dark:hover:bg-slate-800"
                     >
                       Reject
                     </button>
                     <button
                       type="button"
-                      onClick={() => handleModerationDecision(c.id, 'suspended')}
-                      className="px-3 py-1.5 text-xs font-medium text-red-700 dark:text-red-300 border border-red-200 dark:border-red-900 rounded-md"
+                      onClick={() => handleModerationDecision(selectedCampaign.id, 'suspended')}
+                      className="py-2 text-xs font-medium text-red-700 dark:text-red-300 border border-red-200 dark:border-red-900 rounded-md hover:bg-red-50 dark:hover:bg-red-950/40"
                     >
                       Suspend
                     </button>
                   </div>
-                </div>
-              ))}
+                </>
+              ) : (
+                <div className="text-xs text-slate-500">Select a campaign from the moderation queue to inspect its rendered creative.</div>
+              )}
             </div>
           </div>
 
@@ -655,7 +838,8 @@ export const AdminWorkspace: React.FC<AdminWorkspaceProps> = ({ activeTab }) => 
             </div>
           </div>
         </div>
-      )}
+        );
+      })()}
 
       {/* TAB: ADVERTISERS */}
       {tab === 'advertisers' && (

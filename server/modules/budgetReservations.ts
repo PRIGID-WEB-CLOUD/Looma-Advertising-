@@ -1,6 +1,5 @@
 import crypto from 'node:crypto';
-import type { DatabaseSync } from 'node:sqlite';
-import { withTransaction } from '../db';
+import { type DbClient, withTransaction } from '../db/postgres';
 
 export type ReservationStatus = 'active' | 'captured' | 'released' | 'expired';
 
@@ -41,8 +40,8 @@ export interface CaptureReservationResult {
  * 'budget_reserve' financial ledger entry. Guarantees delivery cannot overspend
  * prepaid funds even under concurrent requests.
  */
-export function reserveBudgetForRequest(
-  db: DatabaseSync,
+export async function reserveBudgetForRequest(
+  db: DbClient,
   params: {
     advertiserId: string;
     campaignId: string;
@@ -50,107 +49,126 @@ export function reserveBudgetForRequest(
     amountMicros: number;
     ttlMinutes?: number;
   }
-): ReserveBudgetResult {
+): Promise<ReserveBudgetResult> {
   const amount = Math.max(0, Math.round(params.amountMicros));
   if (amount <= 0) {
     return { reserved: false, reservedMicros: 0, reason: 'zero_reserve_amount' };
   }
   const ttlMinutes = Math.max(1, Math.min(120, Math.round(params.ttlMinutes ?? 30)));
 
-  return withTransaction(db, () => {
-    const existing = db
-      .prepare('SELECT id, amount_micros FROM budget_reservations WHERE request_id = ?')
-      .get(params.requestId) as { id: string; amount_micros: number } | undefined;
+  return withTransaction(db, async (tx) => {
+    const nowMs = Date.now();
+    const nowIso = new Date(nowMs).toISOString();
+    const expiresIso = new Date(nowMs + ttlMinutes * 60_000).toISOString();
+
+    const existing = await tx.queryOne<{ id: string; amount_micros: number }>(
+      'SELECT id, amount_micros FROM budget_reservations WHERE request_id = ?',
+      [params.requestId]
+    );
     if (existing) {
       return {
         reserved: true,
         reservationId: existing.id,
-        reservedMicros: existing.amount_micros,
+        reservedMicros: Number(existing.amount_micros),
       };
     }
 
-    const wallet = db
-      .prepare('SELECT id, available_micros, reserved_micros FROM advertiser_wallets WHERE advertiser_id = ?')
-      .get(params.advertiserId) as
-      | { id: string; available_micros: number; reserved_micros: number }
-      | undefined;
+    const wallet = await tx.queryOne<{ id: string; available_micros: number; reserved_micros: number }>(
+      'SELECT id, available_micros, reserved_micros FROM advertiser_wallets WHERE advertiser_id = ?',
+      [params.advertiserId]
+    );
 
-    if (!wallet || wallet.available_micros < amount) {
+    if (!wallet || Number(wallet.available_micros) < amount) {
       return {
         reserved: false,
         reservedMicros: 0,
-        availableAfterMicros: wallet?.available_micros ?? 0,
+        availableAfterMicros: Number(wallet?.available_micros ?? 0),
         reason: 'insufficient_prepaid_balance',
       };
     }
 
-    const budget = db
-      .prepare(
-        `SELECT daily_budget_micros, total_budget_micros, spent_today_micros, spent_total_micros
-         FROM campaign_budgets WHERE campaign_id = ?`
-      )
-      .get(params.campaignId) as
-      | {
-          daily_budget_micros: number;
-          total_budget_micros: number;
-          spent_today_micros: number;
-          spent_total_micros: number;
-        }
-      | undefined;
+    const budget = await tx.queryOne<{
+      daily_budget_micros: number;
+      total_budget_micros: number;
+      spent_today_micros: number;
+      spent_total_micros: number;
+    }>(
+      `SELECT daily_budget_micros, total_budget_micros, spent_today_micros, spent_total_micros
+       FROM campaign_budgets WHERE campaign_id = ?`,
+      [params.campaignId]
+    );
 
     if (!budget) {
       return { reserved: false, reservedMicros: 0, reason: 'campaign_budget_missing' };
     }
 
-    const activeReservedRow = db
-      .prepare(
-        `SELECT COALESCE(SUM(amount_micros), 0) AS active_reserved
-         FROM budget_reservations
-         WHERE campaign_id = ? AND status = 'active' AND expires_at >= datetime('now')`
-      )
-      .get(params.campaignId) as { active_reserved: number };
+    const activeReservedRow = await tx.queryOne<{ active_reserved: number }>(
+      `SELECT COALESCE(SUM(amount_micros), 0) AS active_reserved
+       FROM budget_reservations
+       WHERE campaign_id = ? AND status = 'active' AND expires_at >= ?`,
+      [params.campaignId, nowIso]
+    );
 
-    const activeReserved = activeReservedRow?.active_reserved ?? 0;
+    const activeReserved = Number(activeReservedRow?.active_reserved ?? 0);
     if (
-      budget.spent_today_micros + activeReserved + amount > budget.daily_budget_micros ||
-      budget.spent_total_micros + activeReserved + amount > budget.total_budget_micros
+      Number(budget.spent_today_micros) + activeReserved + amount > Number(budget.daily_budget_micros) ||
+      Number(budget.spent_total_micros) + activeReserved + amount > Number(budget.total_budget_micros)
     ) {
       return {
         reserved: false,
         reservedMicros: 0,
-        availableAfterMicros: wallet.available_micros,
+        availableAfterMicros: Number(wallet.available_micros),
         reason: 'campaign_budget_headroom_exhausted',
       };
     }
 
-    const nextAvailable = wallet.available_micros - amount;
-    const nextReserved = wallet.reserved_micros + amount;
     const reservationId = `rsv_${crypto.randomUUID().slice(0, 12)}`;
 
-    db.prepare(
+    const walletUpdate = await tx.execute(
       `UPDATE advertiser_wallets
-       SET available_micros = ?, reserved_micros = ?, updated_at = datetime('now')
-       WHERE id = ?`
-    ).run(nextAvailable, nextReserved, wallet.id);
+       SET available_micros = available_micros - ?, reserved_micros = reserved_micros + ?, updated_at = ?
+       WHERE id = ? AND available_micros >= ?`,
+      [amount, amount, nowIso, wallet.id, amount]
+    );
+    if (walletUpdate.rowCount === 0) {
+      const currentWallet = await tx.queryOne<{ available_micros: number }>(
+        'SELECT available_micros FROM advertiser_wallets WHERE id = ?',
+        [wallet.id]
+      );
+      return {
+        reserved: false,
+        reservedMicros: 0,
+        availableAfterMicros: Number(currentWallet?.available_micros ?? 0),
+        reason: 'insufficient_prepaid_balance',
+      };
+    }
 
-    db.prepare(
+    const updatedWallet = await tx.queryOne<{ available_micros: number }>(
+      'SELECT available_micros FROM advertiser_wallets WHERE id = ?',
+      [wallet.id]
+    );
+    const nextAvailable = Number(updatedWallet?.available_micros ?? 0);
+
+    await tx.execute(
       `INSERT INTO budget_reservations
          (id, advertiser_id, wallet_id, campaign_id, request_id, amount_micros, captured_micros, released_micros, status, expires_at)
-       VALUES (?, ?, ?, ?, ?, ?, 0, 0, 'active', datetime('now', ?))`
-    ).run(reservationId, params.advertiserId, wallet.id, params.campaignId, params.requestId, amount, `+${ttlMinutes} minutes`);
+       VALUES (?, ?, ?, ?, ?, ?, 0, 0, 'active', ?)`,
+      [reservationId, params.advertiserId, wallet.id, params.campaignId, params.requestId, amount, expiresIso]
+    );
 
-    db.prepare(
+    await tx.execute(
       `INSERT INTO financial_ledger
          (id, idempotency_key, account_type, account_id, entry_type, direction, amount_micros, balance_after_micros, currency, reference_type, reference_id, description)
-       VALUES (?, ?, 'advertiser_wallet', ?, 'budget_reserve', 'debit', ?, ?, 'USD', 'reservation', ?, ?)`
-    ).run(
-      `led_${crypto.randomUUID().slice(0, 12)}`,
-      `rsv_hold_${params.requestId}`,
-      wallet.id,
-      amount,
-      nextAvailable,
-      reservationId,
-      `Prepaid budget reservation for ad request ${params.requestId}`
+       VALUES (?, ?, 'advertiser_wallet', ?, 'budget_reserve', 'debit', ?, ?, 'USD', 'reservation', ?, ?)`,
+      [
+        `led_${crypto.randomUUID().slice(0, 12)}`,
+        `rsv_hold_${params.requestId}`,
+        wallet.id,
+        amount,
+        nextAvailable,
+        reservationId,
+        `Prepaid budget reservation for ad request ${params.requestId}`,
+      ]
     );
 
     return {
@@ -164,12 +182,9 @@ export function reserveBudgetForRequest(
 
 /**
  * Captures a billable event charge inside an existing caller transaction.
- * Uses the active budget reservation for the request when present (releasing any
- * excess reserved funds back to available_micros), or falls back safely to direct
- * available wallet debit if the reservation expired or wasn't created.
  */
-export function captureReservationInTx(
-  db: DatabaseSync,
+export async function captureReservationInTx(
+  db: DbClient,
   params: {
     advertiserId: string;
     campaignId: string;
@@ -179,106 +194,122 @@ export function captureReservationInTx(
     ledgerIdempotencyKey: string;
     description: string;
   }
-): CaptureReservationResult | null {
+): Promise<CaptureReservationResult | null> {
   const charge = Math.max(0, Math.round(params.chargeMicros));
   if (charge <= 0) return null;
+  const nowIso = new Date().toISOString();
 
-  const wallet = db
-    .prepare('SELECT id, available_micros, reserved_micros FROM advertiser_wallets WHERE advertiser_id = ?')
-    .get(params.advertiserId) as
-    | { id: string; available_micros: number; reserved_micros: number }
-    | undefined;
+  const wallet = await db.queryOne<{ id: string; available_micros: number; reserved_micros: number }>(
+    'SELECT id, available_micros, reserved_micros FROM advertiser_wallets WHERE advertiser_id = ?',
+    [params.advertiserId]
+  );
   if (!wallet) return null;
 
-  const budget = db
-    .prepare(
-      `SELECT daily_budget_micros, total_budget_micros, spent_today_micros, spent_total_micros
-       FROM campaign_budgets WHERE campaign_id = ?`
-    )
-    .get(params.campaignId) as
-    | {
-        daily_budget_micros: number;
-        total_budget_micros: number;
-        spent_today_micros: number;
-        spent_total_micros: number;
-      }
-    | undefined;
-
-  if (
-    !budget ||
-    budget.spent_today_micros + charge > budget.daily_budget_micros ||
-    budget.spent_total_micros + charge > budget.total_budget_micros
-  ) {
-    return null;
-  }
-
-  const resv = db
-    .prepare(
-      `SELECT id, amount_micros
-       FROM budget_reservations
-       WHERE request_id = ? AND advertiser_id = ? AND status = 'active'`
-    )
-    .get(params.requestId, params.advertiserId) as { id: string; amount_micros: number } | undefined;
+  const resv = await db.queryOne<{ id: string; amount_micros: number }>(
+    `SELECT id, amount_micros
+     FROM budget_reservations
+     WHERE request_id = ? AND advertiser_id = ? AND status = 'active'`,
+    [params.requestId, params.advertiserId]
+  );
 
   if (resv) {
-    const fromReserve = Math.min(resv.amount_micros, charge);
+    const resvAmount = Number(resv.amount_micros);
+    const fromReserve = Math.min(resvAmount, charge);
     const extraNeeded = Math.max(0, charge - fromReserve);
-    const excessToRelease = Math.max(0, resv.amount_micros - charge);
+    const excessToRelease = Math.max(0, resvAmount - charge);
 
-    if (wallet.available_micros < extraNeeded) {
+    const claimRes = await db.execute(
+      `UPDATE budget_reservations
+       SET status = 'captured', captured_micros = ?, released_micros = ?, settled_at = ?
+       WHERE id = ? AND status = 'active'`,
+      [charge, excessToRelease, nowIso, resv.id]
+    );
+    if (claimRes.rowCount === 0) {
       return null;
     }
 
-    const nextReserved = Math.max(0, wallet.reserved_micros - resv.amount_micros);
-    const nextAvailable = wallet.available_micros - extraNeeded + excessToRelease;
-
-    db.prepare(
-      `UPDATE advertiser_wallets
-       SET available_micros = ?, reserved_micros = ?, lifetime_spent_micros = lifetime_spent_micros + ?, updated_at = datetime('now')
-       WHERE id = ?`
-    ).run(nextAvailable, nextReserved, charge, wallet.id);
-
-    db.prepare(
+    const budgetRes = await db.execute(
       `UPDATE campaign_budgets
-       SET spent_today_micros = spent_today_micros + ?, spent_total_micros = spent_total_micros + ?, updated_at = datetime('now')
-       WHERE campaign_id = ?`
-    ).run(charge, charge, params.campaignId);
+       SET spent_today_micros = spent_today_micros + ?, spent_total_micros = spent_total_micros + ?, updated_at = ?
+       WHERE campaign_id = ?
+         AND spent_today_micros + ? <= daily_budget_micros
+         AND spent_total_micros + ? <= total_budget_micros`,
+      [charge, charge, nowIso, params.campaignId, charge, charge]
+    );
+    if (budgetRes.rowCount === 0) {
+      await db.execute(
+        `UPDATE budget_reservations
+         SET status = 'active', captured_micros = 0, released_micros = 0, settled_at = NULL
+         WHERE id = ?`,
+        [resv.id]
+      );
+      return null;
+    }
 
-    db.prepare(
-      `UPDATE budget_reservations
-       SET status = 'captured', captured_micros = ?, released_micros = ?, settled_at = datetime('now')
-       WHERE id = ?`
-    ).run(charge, excessToRelease, resv.id);
+    const walletRes = await db.execute(
+      `UPDATE advertiser_wallets
+       SET available_micros = available_micros - ? + ?,
+           reserved_micros = CASE WHEN reserved_micros >= ? THEN reserved_micros - ? ELSE 0 END,
+           lifetime_spent_micros = lifetime_spent_micros + ?,
+           updated_at = ?
+       WHERE id = ? AND available_micros >= ?`,
+      [extraNeeded, excessToRelease, resvAmount, resvAmount, charge, nowIso, wallet.id, extraNeeded]
+    );
+    if (walletRes.rowCount === 0) {
+      await db.execute(
+        `UPDATE campaign_budgets
+         SET spent_today_micros = CASE WHEN spent_today_micros >= ? THEN spent_today_micros - ? ELSE 0 END,
+             spent_total_micros = CASE WHEN spent_total_micros >= ? THEN spent_total_micros - ? ELSE 0 END,
+             updated_at = ?
+         WHERE campaign_id = ?`,
+        [charge, charge, charge, charge, nowIso, params.campaignId]
+      );
+      await db.execute(
+        `UPDATE budget_reservations
+         SET status = 'active', captured_micros = 0, released_micros = 0, settled_at = NULL
+         WHERE id = ?`,
+        [resv.id]
+      );
+      return null;
+    }
+
+    const updatedWallet = await db.queryOne<{ available_micros: number }>(
+      'SELECT available_micros FROM advertiser_wallets WHERE id = ?',
+      [wallet.id]
+    );
+    const nextAvailable = Number(updatedWallet?.available_micros ?? 0);
 
     if (excessToRelease > 0) {
-      db.prepare(
+      await db.execute(
         `INSERT INTO financial_ledger
            (id, idempotency_key, account_type, account_id, entry_type, direction, amount_micros, balance_after_micros, currency, reference_type, reference_id, description)
-         VALUES (?, ?, 'advertiser_wallet', ?, 'budget_release', 'credit', ?, ?, 'USD', 'reservation', ?, ?)`
-      ).run(
-        `led_${crypto.randomUUID().slice(0, 12)}`,
-        `rsv_rel_${resv.id}`,
-        wallet.id,
-        excessToRelease,
-        nextAvailable,
-        resv.id,
-        `Released unused budget reservation surplus for ${params.requestId}`
+         VALUES (?, ?, 'advertiser_wallet', ?, 'budget_release', 'credit', ?, ?, 'USD', 'reservation', ?, ?)`,
+        [
+          `led_${crypto.randomUUID().slice(0, 12)}`,
+          `rsv_rel_${resv.id}`,
+          wallet.id,
+          excessToRelease,
+          nextAvailable,
+          resv.id,
+          `Released unused budget reservation surplus for ${params.requestId}`,
+        ]
       );
     }
 
-    db.prepare(
+    await db.execute(
       `INSERT INTO financial_ledger
          (id, idempotency_key, account_type, account_id, entry_type, direction, amount_micros, balance_after_micros, currency, reference_type, reference_id, description)
-       VALUES (?, ?, 'advertiser_wallet', ?, 'ad_spend', 'debit', ?, ?, 'USD', ?, ?, ?)`
-    ).run(
-      `led_${crypto.randomUUID().slice(0, 12)}`,
-      params.ledgerIdempotencyKey,
-      wallet.id,
-      charge,
-      nextAvailable,
-      params.eventType,
-      params.requestId,
-      params.description
+       VALUES (?, ?, 'advertiser_wallet', ?, 'ad_spend', 'debit', ?, ?, 'USD', ?, ?, ?)`,
+      [
+        `led_${crypto.randomUUID().slice(0, 12)}`,
+        params.ledgerIdempotencyKey,
+        wallet.id,
+        charge,
+        nextAvailable,
+        params.eventType,
+        params.requestId,
+        params.description,
+      ]
     );
 
     return {
@@ -290,37 +321,56 @@ export function captureReservationInTx(
     };
   }
 
-  // Fallback path when no active reservation exists (e.g. direct conversion within 7-day window after expiry)
-  if (wallet.available_micros < charge) {
+  const budgetRes = await db.execute(
+    `UPDATE campaign_budgets
+     SET spent_today_micros = spent_today_micros + ?, spent_total_micros = spent_total_micros + ?, updated_at = ?
+     WHERE campaign_id = ?
+       AND spent_today_micros + ? <= daily_budget_micros
+       AND spent_total_micros + ? <= total_budget_micros`,
+    [charge, charge, nowIso, params.campaignId, charge, charge]
+  );
+  if (budgetRes.rowCount === 0) {
     return null;
   }
 
-  const nextAvailable = wallet.available_micros - charge;
-  db.prepare(
+  const walletRes = await db.execute(
     `UPDATE advertiser_wallets
-     SET available_micros = ?, lifetime_spent_micros = lifetime_spent_micros + ?, updated_at = datetime('now')
-     WHERE id = ?`
-  ).run(nextAvailable, charge, wallet.id);
+     SET available_micros = available_micros - ?, lifetime_spent_micros = lifetime_spent_micros + ?, updated_at = ?
+     WHERE id = ? AND available_micros >= ?`,
+    [charge, charge, nowIso, wallet.id, charge]
+  );
+  if (walletRes.rowCount === 0) {
+    await db.execute(
+      `UPDATE campaign_budgets
+       SET spent_today_micros = CASE WHEN spent_today_micros >= ? THEN spent_today_micros - ? ELSE 0 END,
+           spent_total_micros = CASE WHEN spent_total_micros >= ? THEN spent_total_micros - ? ELSE 0 END,
+           updated_at = ?
+       WHERE campaign_id = ?`,
+      [charge, charge, charge, charge, nowIso, params.campaignId]
+    );
+    return null;
+  }
 
-  db.prepare(
-    `UPDATE campaign_budgets
-     SET spent_today_micros = spent_today_micros + ?, spent_total_micros = spent_total_micros + ?, updated_at = datetime('now')
-     WHERE campaign_id = ?`
-  ).run(charge, charge, params.campaignId);
+  const updatedWallet = await db.queryOne<{ available_micros: number }>(
+    'SELECT available_micros FROM advertiser_wallets WHERE id = ?',
+    [wallet.id]
+  );
+  const nextAvailable = Number(updatedWallet?.available_micros ?? 0);
 
-  db.prepare(
+  await db.execute(
     `INSERT INTO financial_ledger
        (id, idempotency_key, account_type, account_id, entry_type, direction, amount_micros, balance_after_micros, currency, reference_type, reference_id, description)
-     VALUES (?, ?, 'advertiser_wallet', ?, 'ad_spend', 'debit', ?, ?, 'USD', ?, ?, ?)`
-  ).run(
-    `led_${crypto.randomUUID().slice(0, 12)}`,
-    params.ledgerIdempotencyKey,
-    wallet.id,
-    charge,
-    nextAvailable,
-    params.eventType,
-    params.requestId,
-    params.description
+     VALUES (?, ?, 'advertiser_wallet', ?, 'ad_spend', 'debit', ?, ?, 'USD', ?, ?, ?)`,
+    [
+      `led_${crypto.randomUUID().slice(0, 12)}`,
+      params.ledgerIdempotencyKey,
+      wallet.id,
+      charge,
+      nextAvailable,
+      params.eventType,
+      params.requestId,
+      params.description,
+    ]
   );
 
   return {
@@ -333,118 +383,138 @@ export function captureReservationInTx(
 }
 
 /**
- * Releases a single active reservation back into the advertiser's available wallet
- * (for example, when a click is rejected as invalid bot traffic or manually cancelled).
+ * Releases a single active reservation back into the advertiser's available wallet.
  */
-export function releaseReservationInTx(
-  db: DatabaseSync,
+export async function releaseReservationInTx(
+  db: DbClient,
   requestId: string,
   reason = 'Released unused ad delivery reservation'
-): { released: boolean; amountMicros: number } {
-  const resv = db
-    .prepare(
-      `SELECT id, wallet_id, amount_micros
-       FROM budget_reservations
-       WHERE request_id = ? AND status = 'active'`
-    )
-    .get(requestId) as { id: string; wallet_id: string; amount_micros: number } | undefined;
+): Promise<{ released: boolean; amountMicros: number }> {
+  const resv = await db.queryOne<{ id: string; wallet_id: string; amount_micros: number }>(
+    `SELECT id, wallet_id, amount_micros
+     FROM budget_reservations
+     WHERE request_id = ? AND status = 'active'`,
+    [requestId]
+  );
 
   if (!resv) return { released: false, amountMicros: 0 };
 
-  const wallet = db
-    .prepare('SELECT id, available_micros, reserved_micros FROM advertiser_wallets WHERE id = ?')
-    .get(resv.wallet_id) as { id: string; available_micros: number; reserved_micros: number } | undefined;
+  const nowIso = new Date().toISOString();
+  const resvAmount = Number(resv.amount_micros);
 
-  if (!wallet) return { released: false, amountMicros: 0 };
-
-  const nextAvailable = wallet.available_micros + resv.amount_micros;
-  const nextReserved = Math.max(0, wallet.reserved_micros - resv.amount_micros);
-
-  db.prepare(
-    `UPDATE advertiser_wallets
-     SET available_micros = ?, reserved_micros = ?, updated_at = datetime('now')
-     WHERE id = ?`
-  ).run(nextAvailable, nextReserved, wallet.id);
-
-  db.prepare(
+  const claimRes = await db.execute(
     `UPDATE budget_reservations
-     SET status = 'released', released_micros = ?, settled_at = datetime('now')
-     WHERE id = ?`
-  ).run(resv.amount_micros, resv.id);
+     SET status = 'released', released_micros = ?, settled_at = ?
+     WHERE id = ? AND status = 'active'`,
+    [resvAmount, nowIso, resv.id]
+  );
+  if (claimRes.rowCount === 0) {
+    return { released: false, amountMicros: 0 };
+  }
 
-  db.prepare(
+  const walletUpdate = await db.execute(
+    `UPDATE advertiser_wallets
+     SET available_micros = available_micros + ?,
+         reserved_micros = CASE WHEN reserved_micros >= ? THEN reserved_micros - ? ELSE 0 END,
+         updated_at = ?
+     WHERE id = ?`,
+    [resvAmount, resvAmount, resvAmount, nowIso, resv.wallet_id]
+  );
+  if (walletUpdate.rowCount === 0) {
+    return { released: false, amountMicros: 0 };
+  }
+
+  const updatedWallet = await db.queryOne<{ available_micros: number }>(
+    'SELECT available_micros FROM advertiser_wallets WHERE id = ?',
+    [resv.wallet_id]
+  );
+  const nextAvailable = Number(updatedWallet?.available_micros ?? 0);
+
+  await db.execute(
     `INSERT INTO financial_ledger
        (id, idempotency_key, account_type, account_id, entry_type, direction, amount_micros, balance_after_micros, currency, reference_type, reference_id, description)
-     VALUES (?, ?, 'advertiser_wallet', ?, 'budget_release', 'credit', ?, ?, 'USD', 'reservation', ?, ?)`
-  ).run(
-    `led_${crypto.randomUUID().slice(0, 12)}`,
-    `rsv_rel_${resv.id}`,
-    wallet.id,
-    resv.amount_micros,
-    nextAvailable,
-    resv.id,
-    reason
+     VALUES (?, ?, 'advertiser_wallet', ?, 'budget_release', 'credit', ?, ?, 'USD', 'reservation', ?, ?)`,
+    [
+      `led_${crypto.randomUUID().slice(0, 12)}`,
+      `rsv_rel_${resv.id}`,
+      resv.wallet_id,
+      resvAmount,
+      nextAvailable,
+      resv.id,
+      reason,
+    ]
   );
 
-  return { released: true, amountMicros: resv.amount_micros };
+  return { released: true, amountMicros: resvAmount };
 }
 
 /**
  * Releases all expired active reservations back to advertiser available balances.
- * Invoked by the scheduled maintenance job and admin operations.
  */
-export function releaseExpiredReservationsInTx(db: DatabaseSync): {
+export async function releaseExpiredReservationsInTx(db: DbClient): Promise<{
   releasedCount: number;
   totalReleasedMicros: number;
-} {
-  const expiredRows = db
-    .prepare(
-      `SELECT id, wallet_id, request_id, amount_micros
-       FROM budget_reservations
-       WHERE status = 'active' AND expires_at <= datetime('now')`
-    )
-    .all() as Array<{ id: string; wallet_id: string; request_id: string; amount_micros: number }>;
+}> {
+  const nowIso = new Date().toISOString();
+  const expiredRows = await db.query<{
+    id: string;
+    wallet_id: string;
+    request_id: string;
+    amount_micros: number;
+  }>(
+    `SELECT id, wallet_id, request_id, amount_micros
+     FROM budget_reservations
+     WHERE status = 'active' AND expires_at <= ?`,
+    [nowIso]
+  );
 
   let releasedCount = 0;
   let totalReleasedMicros = 0;
 
   for (const row of expiredRows) {
-    const wallet = db
-      .prepare('SELECT id, available_micros, reserved_micros FROM advertiser_wallets WHERE id = ?')
-      .get(row.wallet_id) as { id: string; available_micros: number; reserved_micros: number } | undefined;
-    if (!wallet) continue;
+    const rowAmount = Number(row.amount_micros);
 
-    const nextAvailable = wallet.available_micros + row.amount_micros;
-    const nextReserved = Math.max(0, wallet.reserved_micros - row.amount_micros);
-
-    db.prepare(
-      `UPDATE advertiser_wallets
-       SET available_micros = ?, reserved_micros = ?, updated_at = datetime('now')
-       WHERE id = ?`
-    ).run(nextAvailable, nextReserved, wallet.id);
-
-    db.prepare(
+    const claimRes = await db.execute(
       `UPDATE budget_reservations
-       SET status = 'expired', released_micros = ?, settled_at = datetime('now')
-       WHERE id = ?`
-    ).run(row.amount_micros, row.id);
+       SET status = 'expired', released_micros = ?, settled_at = ?
+       WHERE id = ? AND status = 'active'`,
+      [rowAmount, nowIso, row.id]
+    );
+    if (claimRes.rowCount === 0) continue;
 
-    db.prepare(
+    const walletUpdate = await db.execute(
+      `UPDATE advertiser_wallets
+       SET available_micros = available_micros + ?,
+           reserved_micros = CASE WHEN reserved_micros >= ? THEN reserved_micros - ? ELSE 0 END,
+           updated_at = ?
+       WHERE id = ?`,
+      [rowAmount, rowAmount, rowAmount, nowIso, row.wallet_id]
+    );
+    if (walletUpdate.rowCount === 0) continue;
+
+    const updatedWallet = await db.queryOne<{ available_micros: number }>(
+      'SELECT available_micros FROM advertiser_wallets WHERE id = ?',
+      [row.wallet_id]
+    );
+    const nextAvailable = Number(updatedWallet?.available_micros ?? 0);
+
+    await db.execute(
       `INSERT INTO financial_ledger
          (id, idempotency_key, account_type, account_id, entry_type, direction, amount_micros, balance_after_micros, currency, reference_type, reference_id, description)
-       VALUES (?, ?, 'advertiser_wallet', ?, 'budget_release', 'credit', ?, ?, 'USD', 'reservation_expiry', ?, ?)`
-    ).run(
-      `led_${crypto.randomUUID().slice(0, 12)}`,
-      `rsv_exp_${row.id}`,
-      wallet.id,
-      row.amount_micros,
-      nextAvailable,
-      row.id,
-      `Expired budget reservation released for request ${row.request_id}`
+       VALUES (?, ?, 'advertiser_wallet', ?, 'budget_release', 'credit', ?, ?, 'USD', 'reservation_expiry', ?, ?)`,
+      [
+        `led_${crypto.randomUUID().slice(0, 12)}`,
+        `rsv_exp_${row.id}`,
+        row.wallet_id,
+        rowAmount,
+        nextAvailable,
+        row.id,
+        `Expired budget reservation released for request ${row.request_id}`,
+      ]
     );
 
     releasedCount += 1;
-    totalReleasedMicros += row.amount_micros;
+    totalReleasedMicros += rowAmount;
   }
 
   return { releasedCount, totalReleasedMicros };

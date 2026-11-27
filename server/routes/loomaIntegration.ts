@@ -1,6 +1,6 @@
-import { Router, type Request, type Response } from 'express';
-import type { DatabaseSync } from 'node:sqlite';
+import { createAppRouter, type AppRouter, type Request, type Response } from '../http/router';
 import { authenticateBearerToken } from '../auth';
+import type { DbClient } from '../db/postgres';
 import { checkPersistentRateLimit } from '../jobs';
 import { getFeatureFlags } from '../modules/featureFlags';
 import {
@@ -18,41 +18,41 @@ import {
   validateTextLength,
 } from '../../src/lib/validation';
 
-export function createLoomaIntegrationRouter(db: DatabaseSync): Router {
-  const router = Router();
+export function createLoomaIntegrationRouter(db: DbClient): AppRouter {
+  const router = createAppRouter();
 
   // GET /api/v1/looma/contract — Public Looma publisher integration contract metadata
-  router.get('/contract', (_req: Request, res: Response) => {
-    const loomaPublisher = db
-      .prepare(
-        `SELECT id, organization_name, publisher_type, approval_status
-         FROM publisher_accounts
-         WHERE publisher_type = 'first_party'
-         ORDER BY created_at ASC
-         LIMIT 1`
-      )
-      .get() as
-      | { id: string; organization_name: string; publisher_type: string; approval_status: string }
-      | undefined;
+  router.get('/contract', async (_req: Request, res: Response) => {
+    const loomaPublisher = await db.queryOne<{
+      id: string;
+      organization_name: string;
+      publisher_type: string;
+      approval_status: string;
+    }>(
+      `SELECT id, organization_name, publisher_type, approval_status
+       FROM publisher_accounts
+       WHERE publisher_type = 'first_party'
+       ORDER BY created_at ASC
+       LIMIT 1`
+    );
 
     const placements = loomaPublisher
-      ? (db
-          .prepare(
-            `SELECT ap.id, ap.name, ap.format, ap.dimensions, ap.floor_cpm_micros, ap.status,
-                    pp.name AS property_name, pp.domain_or_bundle
-             FROM ad_placements ap
-             JOIN publisher_properties pp ON pp.id = ap.property_id
-             WHERE ap.publisher_id = ? AND ap.status = 'active'
-             ORDER BY ap.id ASC`
-          )
-          .all(loomaPublisher.id) as Array<Record<string, unknown>>)
+      ? await db.query<Record<string, unknown>>(
+          `SELECT ap.id, ap.name, ap.format, ap.dimensions, ap.floor_cpm_micros, ap.status,
+                  pp.name AS property_name, pp.domain_or_bundle
+           FROM ad_placements ap
+           JOIN publisher_properties pp ON pp.id = ap.property_id
+           WHERE ap.publisher_id = ? AND ap.status = 'active'
+           ORDER BY ap.id ASC`,
+          [loomaPublisher.id]
+        )
       : [];
 
     res.json({
       contractVersion: '2026-11-v1',
       publisher: loomaPublisher || null,
       placements,
-      featureFlags: getFeatureFlags(db),
+      featureFlags: await getFeatureFlags(db),
       endpoints: {
         feedAdSelection: '/api/v1/looma/feed/ads',
         ssoExchange: '/api/v1/looma/sso/exchange',
@@ -122,7 +122,7 @@ export function createLoomaIntegrationRouter(db: DatabaseSync): Router {
   });
 
   // POST /api/v1/looma/sso/exchange — Cryptographically verified Looma SSO + business membership exchange
-  router.post('/sso/exchange', (req: Request, res: Response) => {
+  router.post('/sso/exchange', async (req: Request, res: Response) => {
     const assertion = asTrimmedString(req.body?.assertion) || '';
     if (!assertion || assertion.length > 4096) {
       recordSsoMetric(false);
@@ -133,7 +133,7 @@ export function createLoomaIntegrationRouter(db: DatabaseSync): Router {
       return;
     }
 
-    const result = exchangeLoomaSsoSession(db, assertion);
+    const result = await exchangeLoomaSsoSession(db, assertion);
     if (!result.ok) {
       recordSsoMetric(false);
       res.status(result.status).json({ error: result.error });
@@ -150,19 +150,19 @@ export function createLoomaIntegrationRouter(db: DatabaseSync): Router {
   });
 
   // POST /api/v1/looma/feed/ads — Multi-slot Looma Feed Ad Selection Adapter (requires adapter key or publisher/admin session)
-  router.post('/feed/ads', (req: Request, res: Response) => {
+  router.post('/feed/ads', async (req: Request, res: Response) => {
     const startedAt = performance.now();
     const hasAdapterKey = verifyLoomaAdapterAuth(req.header('x-looma-adapter-key'));
     if (!hasAdapterKey) {
-      const authResult = authenticateBearerToken(db, req.headers.authorization);
+      const authResult = await authenticateBearerToken(db, req.header('authorization'));
       if (!authResult.ok || !['publisher', 'admin'].includes(authResult.session.role)) {
         res.status(401).json({ error: 'Unauthorized: provide a valid Looma adapter key or sign in as a publisher/admin' });
         return;
       }
     }
 
-    const clientIp = (req.ip || req.socket.remoteAddress || '127.0.0.1').toString();
-    if (!checkPersistentRateLimit(db, `loomafeed:${clientIp}`, 360)) {
+    const clientIp = (req.ip || req.socket?.remoteAddress || '127.0.0.1').toString();
+    if (!(await checkPersistentRateLimit(db, `loomafeed:${clientIp}`, 360))) {
       res.status(429).json({ error: 'Rate limit exceeded for Looma feed ad selection' });
       return;
     }
@@ -202,16 +202,14 @@ export function createLoomaIntegrationRouter(db: DatabaseSync): Router {
         }))
         .filter((s) => s.placementId.length > 0 && s.placementId.length <= 80);
     } else if (slots === undefined) {
-      const defaultPlacements = db
-        .prepare(
-          `SELECT ap.id
-           FROM ad_placements ap
-           JOIN publisher_accounts pub ON pub.id = ap.publisher_id
-           WHERE pub.publisher_type = 'first_party' AND ap.status = 'active'
-           ORDER BY ap.id ASC
-           LIMIT 3`
-        )
-        .all() as Array<{ id: string }>;
+      const defaultPlacements = await db.query<{ id: string }>(
+        `SELECT ap.id
+         FROM ad_placements ap
+         JOIN publisher_accounts pub ON pub.id = ap.publisher_id
+         WHERE pub.publisher_type = 'first_party' AND ap.status = 'active'
+         ORDER BY ap.id ASC
+         LIMIT 3`
+      );
       normalizedSlots = defaultPlacements.map((p, idx) => ({
         slotIndex: idx * 4 + 2,
         placementId: p.id,
@@ -227,7 +225,7 @@ export function createLoomaIntegrationRouter(db: DatabaseSync): Router {
       return;
     }
 
-    const response = selectLoomaFeedAds(db, {
+    const response = await selectLoomaFeedAds(db, {
       slots: normalizedSlots,
       country: String(country),
       language: String(language),

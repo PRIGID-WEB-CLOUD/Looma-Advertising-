@@ -1,6 +1,15 @@
 import React, { useEffect, useState } from 'react';
 import { Menu, Moon, Sun } from 'lucide-react';
-import { apiRequest, AuthUser, FxRateEntry, setAuthToken, setDisplayCurrency, setFxRates } from './lib/api';
+import {
+  apiRequest,
+  AuthUser,
+  FxRateEntry,
+  getAuthToken,
+  setAuthToken,
+  setDisplayCurrency,
+  setFxRates,
+  setUnauthorizedHandler,
+} from './lib/api';
 import { AdminWorkspace, AdminTab } from './components/AdminWorkspace';
 import { AdminSidebar } from './components/AdminSidebar';
 import { AdminLoginScreen } from './components/AdminLoginScreen';
@@ -8,12 +17,31 @@ import { AccountMenu, AccountSection } from './components/AccountMenu';
 import { AccountModal } from './components/AccountModal';
 import { SupportPrivacyModal, SupportPrivacyMode } from './components/SupportPrivacyModal';
 
+function readStoredString(key: string): string | null {
+  try {
+    return typeof window !== 'undefined' && window.localStorage ? window.localStorage.getItem(key) : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeStoredString(key: string, value: string | null) {
+  try {
+    if (typeof window === 'undefined' || !window.localStorage) return;
+    if (value === null) window.localStorage.removeItem(key);
+    else window.localStorage.setItem(key, value);
+  } catch {
+    // Ignore storage errors
+  }
+}
+
 export const App: React.FC = () => {
   const [user, setUser] = useState<AuthUser | null>(null);
-  const [isDark, setIsDark] = useState(false);
+  const [restoringSession, setRestoringSession] = useState<boolean>(() => Boolean(getAuthToken()));
+  const [isDark, setIsDark] = useState<boolean>(() => readStoredString('looma_admin_theme') === 'dark');
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
-  const [adminTab, setAdminTab] = useState<AdminTab>('overview');
+  const [adminTab, setAdminTab] = useState<AdminTab>(() => (readStoredString('looma_admin_tab') as AdminTab) || 'overview');
   const [accountModal, setAccountModal] = useState<{ open: boolean; section: AccountSection }>({
     open: false,
     section: 'profile',
@@ -26,7 +54,60 @@ export const App: React.FC = () => {
 
   useEffect(() => {
     document.documentElement.classList.toggle('dark', isDark);
+    writeStoredString('looma_admin_theme', isDark ? 'dark' : 'light');
   }, [isDark]);
+
+  useEffect(() => {
+    writeStoredString('looma_admin_tab', adminTab);
+  }, [adminTab]);
+
+  useEffect(() => {
+    setUnauthorizedHandler(() => {
+      setUser(null);
+      setAccountModal((prev) => ({ ...prev, open: false }));
+      setSupportModal((prev) => ({ ...prev, open: false }));
+    });
+    return () => setUnauthorizedHandler(null);
+  }, []);
+
+  useEffect(() => {
+    const token = getAuthToken();
+    if (!token) {
+      setRestoringSession(false);
+      return;
+    }
+    let cancelled = false;
+    apiRequest<{ profile?: AuthUser; preferences?: { preferredCurrency?: string } }>('/api/auth/account')
+      .then((acc) => {
+        if (cancelled) return;
+        if (!acc.profile || acc.profile.role !== 'admin') {
+          setAuthToken(null);
+          setUser(null);
+          return;
+        }
+        setUser({
+          id: acc.profile.id,
+          email: acc.profile.email,
+          fullName: acc.profile.fullName,
+          role: acc.profile.role,
+        });
+        if (acc.preferences?.preferredCurrency) {
+          setDisplayCurrency(acc.preferences.preferredCurrency);
+          setCurrencyVersion((v) => v + 1);
+        }
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setAuthToken(null);
+        setUser(null);
+      })
+      .finally(() => {
+        if (!cancelled) setRestoringSession(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     apiRequest<{ rates: Record<string, FxRateEntry> }>('/api/public/fx-rates')
@@ -68,6 +149,17 @@ export const App: React.FC = () => {
     setAccountModal((prev) => ({ ...prev, open: false }));
     setSupportModal((prev) => ({ ...prev, open: false }));
     window.scrollTo({ top: 0 });
+  }
+
+  if (!user && restoringSession) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-slate-50 dark:bg-slate-950 text-slate-600 dark:text-slate-300">
+        <div className="flex items-center gap-3 text-sm font-medium">
+          <div className="w-5 h-5 rounded-full border-2 border-blue-600 border-t-transparent animate-spin" />
+          <span>Restoring admin session…</span>
+        </div>
+      </div>
+    );
   }
 
   if (!user) {

@@ -31,8 +31,8 @@ async function startTestServer() {
   const tempUploadDir = fs.mkdtempSync(path.join(os.tmpdir(), 'looma-ads-uploads-'));
   process.env.LOOMA_STORAGE_DIR = tempUploadDir;
 
-  const db = getDb(':memory:');
-  seedDatabaseIfEmpty(db);
+  const db = await getDb(':memory:');
+  await seedDatabaseIfEmpty(db);
 
   const app = express();
   app.use((_req, res, next) => {
@@ -149,11 +149,11 @@ async function startTestServer() {
 
   async function authenticateTestActors() {
     // Provision test-only passwords in the isolated in-memory test DB and sign in through real endpoints
-    db.prepare("UPDATE users SET password_hash = ? WHERE id = 'usr_adv_1'").run(hashPassword('TestAdvPass!123'));
-    db.prepare("UPDATE users SET password_hash = ? WHERE id = 'usr_pub_looma'").run(hashPassword('TestPubPass!123'));
+    await db.execute("UPDATE users SET password_hash = ? WHERE id = 'usr_adv_1'", [hashPassword('TestAdvPass!123')]);
+    await db.execute("UPDATE users SET password_hash = ? WHERE id = 'usr_pub_looma'", [hashPassword('TestPubPass!123')]);
 
-    const advRow = db.prepare("SELECT email FROM users WHERE id = 'usr_adv_1'").get() as { email: string };
-    const pubRow = db.prepare("SELECT email FROM users WHERE id = 'usr_pub_looma'").get() as { email: string };
+    const advRow = (await db.queryOne<{ email: string }>("SELECT email FROM users WHERE id = 'usr_adv_1'"))!;
+    const pubRow = (await db.queryOne<{ email: string }>("SELECT email FROM users WHERE id = 'usr_pub_looma'"))!;
 
     const advLogin = await reqJson('/api/auth/login', {
       method: 'POST',
@@ -186,6 +186,7 @@ async function startTestServer() {
 
   async function close() {
     await new Promise<void>((resolve) => server.close(() => resolve()));
+    await db.close();
     fs.rmSync(tempUploadDir, { recursive: true, force: true });
   }
 
@@ -265,6 +266,12 @@ test('HTTP E2E: Security Hardening — Auth, Demo Bypass Blocked, One-Time Admin
       assert.equal(bypass.data.token, undefined);
     }
 
+    // Stale admin_claimed flag without an active admin user must not lock out initial setup
+    await db.execute("UPDATE users SET status = 'suspended' WHERE role_id = 'role_admin'");
+    await db.execute(
+      "INSERT INTO platform_settings (key, value_json) VALUES ('admin_claimed', 'true') ON CONFLICT (key) DO UPDATE SET value_json = 'true'"
+    );
+
     // One-time admin claim succeeds once, then permanently locks itself
     const setupBefore = await reqJson('/api/auth/admin-setup-status');
     assert.equal(setupBefore.status, 200);
@@ -320,7 +327,7 @@ test('HTTP E2E: Security Hardening — Auth, Demo Bypass Blocked, One-Time Admin
     assert.equal((await reqJson('/api/admin/overview', { token: pubReg.data.token as string })).status, 403);
 
     // Feature flag kill switch still blocks publisher registration if disabled by admin
-    db.prepare("UPDATE platform_settings SET value_json = 'false' WHERE key = 'external_publisher_registration_enabled'").run();
+    await db.execute("UPDATE platform_settings SET value_json = 'false' WHERE key = 'external_publisher_registration_enabled'");
     const pubBlock = await reqJson('/api/auth/register', {
       method: 'POST',
       body: {
@@ -332,7 +339,7 @@ test('HTTP E2E: Security Hardening — Auth, Demo Bypass Blocked, One-Time Admin
       },
     });
     assert.equal(pubBlock.status, 403);
-    db.prepare("UPDATE platform_settings SET value_json = 'true' WHERE key = 'external_publisher_registration_enabled'").run();
+    await db.execute("UPDATE platform_settings SET value_json = 'true' WHERE key = 'external_publisher_registration_enabled'");
 
     // Register advertiser
     const reg = await reqJson('/api/auth/register', {
@@ -418,11 +425,9 @@ test('HTTP E2E: Security Hardening — Auth, Demo Bypass Blocked, One-Time Admin
     assert.equal(reqVerify.status, 200);
     assert.equal(reqVerify.data.previewCode, undefined);
 
-    const verifyEmailRow = db
-      .prepare(
-        "SELECT body_text FROM email_outbox WHERE recipient_email = 'crud.adv@example.com' AND subject LIKE '%Verify%' ORDER BY created_at DESC LIMIT 1"
-      )
-      .get() as { body_text: string };
+    const verifyEmailRow = (await db.queryOne<{ body_text: string }>(
+      "SELECT body_text FROM email_outbox WHERE recipient_email = 'crud.adv@example.com' AND subject LIKE '%Verify%' ORDER BY created_at DESC LIMIT 1"
+    ))!;
     const verifyCodeMatch = verifyEmailRow.body_text.match(/\b(\d{6})\b/);
     assert.ok(verifyCodeMatch);
 
@@ -465,11 +470,9 @@ test('HTTP E2E: Security Hardening — Auth, Demo Bypass Blocked, One-Time Admin
     assert.equal(forgot.status, 200);
     assert.equal(forgot.data.previewResetCode, undefined);
 
-    const resetEmailRow = db
-      .prepare(
-        "SELECT body_text FROM email_outbox WHERE recipient_email = 'crud.adv@example.com' AND subject LIKE '%Reset%' ORDER BY created_at DESC LIMIT 1"
-      )
-      .get() as { body_text: string };
+    const resetEmailRow = (await db.queryOne<{ body_text: string }>(
+      "SELECT body_text FROM email_outbox WHERE recipient_email = 'crud.adv@example.com' AND subject LIKE '%Reset%' ORDER BY created_at DESC LIMIT 1"
+    ))!;
     const resetCodeMatch = resetEmailRow.body_text.match(/reset code ([A-F0-9]{8})/i);
     assert.ok(resetCodeMatch);
 
@@ -834,6 +837,15 @@ test('HTTP E2E: Publisher CRUD, Admin Operations, Appeals, Withdrawals, Hardened
     });
     assert.equal(appealCamp.status, 201);
     const appealCampId = appealCamp.data.campaignId as string;
+
+    const modQueue = await reqJson('/api/admin/moderation', { token: adminToken });
+    assert.equal(modQueue.status, 200);
+    assert.ok(Array.isArray(modQueue.data.campaigns) && modQueue.data.campaigns.length > 0);
+    const inspectedCamp = modQueue.data.campaigns.find((c: Record<string, unknown>) => c.id === appealCampId);
+    assert.ok(inspectedCamp);
+    assert.equal(typeof inspectedCamp.ad_format, 'string');
+    assert.equal(typeof inspectedCamp.dimensions, 'string');
+    assert.equal(typeof inspectedCamp.cta_text, 'string');
 
     assert.equal(
       (

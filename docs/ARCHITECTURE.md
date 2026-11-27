@@ -55,10 +55,10 @@ All flags are persisted in `platform_settings`, enforced server-side across auth
 
 ---
 
-## 5. Production Edge Deployment Mapping (Cloudflare + PostgreSQL/Drizzle)
+## 5. Production Edge Deployment (Cloudflare Workers + Hono + PostgreSQL/Drizzle)
 
-The current sandbox runs natively on Node.js + Express + SQLite for zero-config execution and instant local verification, while maintaining a clean production migration path:
-- **Database & ORM**: Apply `server/db/drizzle-schema.ts` to PostgreSQL (Neon / Cloud SQL / Hyperdrive) using Drizzle ORM.
-- **Backend Runtime**: Port route handlers (`server/routes/*`) onto **Hono** on **Cloudflare Workers** (pure TypeScript modules in `server/engine.ts` and `server/modules/*` have zero Express coupling).
-- **Media Storage**: Map `/api/advertiser/media` and `/api/media/:filename` directly to a **Cloudflare R2** bucket.
-- **Background Jobs & Scheduling**: Trigger `server/jobs.ts` tasks (`release_expired_reservations`, `daily_budget_reset`, `publisher_earnings_settlement`, `expired_token_cleanup`) via **Cloudflare Cron Triggers** and asynchronous event fan-out via **Cloudflare Queues**.
+LOOMA ADS supports both local Node/Express development (`server.ts`) and unified edge deployment on **Cloudflare Workers + Hono** (`worker/index.ts`, `wrangler.jsonc`):
+- **Database & ORM**: PostgreSQL schema (`server/db/drizzle-schema.ts`, `server/db/postgres.ts`) with Drizzle ORM and request-scoped client connections compatible with **Cloudflare Hyperdrive** (`HYPERDRIVE`) or direct `DATABASE_URL`.
+- **Backend Runtime**: `worker/index.ts` runs **Hono** with `worker/honoBridge.ts`, mounting all portable `AppRouter` modules (`server/routes/*`) with zero Express coupling, plus Workers Static Assets (`dist/` + `dist/admin/`) served at the edge.
+- **Media Storage**: `worker/r2Storage.ts` maps `/api/advertiser/media` and `/api/media/:filename` directly to the dedicated **Cloudflare R2** bucket (`looma-ads-media`).
+- **Background Jobs & Scheduling**: Asynchronous ad delivery events fan out via **Cloudflare Queues** (`looma-ads-events` producer + `queue()` consumer), and **Cloudflare Cron Triggers** (`*/5 * * * *` and `0 0 * * *`) execute `server/jobs.ts` via `scheduled()`.

@@ -1,4 +1,4 @@
-import type { DatabaseSync } from 'node:sqlite';
+import type { DbClient } from '../db/postgres';
 
 interface MonitoringCounters {
   startedAtIso: string;
@@ -59,9 +59,9 @@ export function computePercentile(samples: number[], percentile: number): number
   return sorted[idx];
 }
 
-export function getOperationalMonitoringSnapshot(db: DatabaseSync) {
-  const dbCounts = db
-    .prepare(
+export async function getOperationalMonitoringSnapshot(db: DbClient) {
+  const dbCounts =
+    (await db.queryOne<Record<string, number>>(
       `SELECT
          (SELECT COUNT(*) FROM budget_reservations WHERE status = 'active') AS active_reservations,
          (SELECT COALESCE(SUM(amount_micros), 0) FROM budget_reservations WHERE status = 'active') AS active_reserved_micros,
@@ -70,8 +70,7 @@ export function getOperationalMonitoringSnapshot(db: DatabaseSync) {
          (SELECT COUNT(*) FROM looma_identity_links) AS linked_looma_identities,
          (SELECT COUNT(*) FROM financial_ledger) AS total_ledger_entries,
          (SELECT COUNT(*) FROM fraud_alerts WHERE status IN ('open', 'investigating')) AS open_fraud_alerts`
-    )
-    .get() as Record<string, number>;
+    )) ?? {};
 
   return {
     service: 'looma-ads',
